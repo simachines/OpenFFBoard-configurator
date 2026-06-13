@@ -7,8 +7,9 @@ import main
 from base_ui import WidgetUI
 from optionsdialog import OptionsDialog,OptionsDialogGroupBox
 
-from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis, QBarSeries, QBarSet
+from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis, QBarSeries, QBarSet, QScatterSeries
 from base_ui import CommunicationHandler
+import math
 
 
 ext_notice = """External encoder forwards the encoder
@@ -40,6 +41,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.cogging_supported = False
         self.cogging_dialog = None
         self.cogging_text = ""
+        self.cogging_harmonics_data = []  # [(order, amplitude, phase), ...]
+        self.cogging_position = 0.0  # normalized 0-1
         self.max_datapoints = 10000
         self.max_datapointsVisibleTime = 30
         self.adc_to_amps = 0#2.5 / (0x7fff * 60.0 * 0.0015)
@@ -176,6 +179,59 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         for ax in self.chart_cogging.axes():
             ax.setLabelsBrush(QApplication.instance().palette().text())
 
+        # --- Anti-Cogging Profile Chart (position vs torque) ---
+        self.chart_cogging_profile = QChart()
+        self.chart_cogging_profile.setBackgroundRoundness(5)
+        self.chart_cogging_profile.setMargins(QMargins(0,0,0,0))
+        self.chart_cogging_profile.setTitle("Anti-Cogging Profile")
+
+        self.chart_cp_Xaxis = QValueAxis(self.chart_cogging_profile)
+        self.chart_cp_Xaxis.setRange(0, 360)
+        self.chart_cp_Xaxis.setTitleText("Position (deg)")
+        self.chart_cp_Xaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),128))
+        self.chart_cogging_profile.addAxis(self.chart_cp_Xaxis, Qt.AlignmentFlag.AlignBottom)
+
+        self.chart_cp_Yaxis = QValueAxis(self.chart_cogging_profile)
+        self.chart_cp_Yaxis.setTitleText("Torque")
+        self.chart_cp_Yaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
+        self.chart_cogging_profile.setBackgroundBrush(QApplication.instance().palette().window())
+        self.chart_cogging_profile.addAxis(self.chart_cp_Yaxis, Qt.AlignmentFlag.AlignLeft)
+
+        # Waveform line
+        self.line_cp_waveform = QLineSeries(self.chart_cogging_profile)
+        self.line_cp_waveform.setName("Compensation")
+        self.line_cp_waveform.setColor(QColor("cornflowerblue"))
+        self.chart_cogging_profile.addSeries(self.line_cp_waveform)
+        self.line_cp_waveform.attachAxis(self.chart_cp_Xaxis)
+        self.line_cp_waveform.attachAxis(self.chart_cp_Yaxis)
+
+        # Position dot
+        self.scatter_cp_pos = QScatterSeries(self.chart_cogging_profile)
+        self.scatter_cp_pos.setName("Position")
+        self.scatter_cp_pos.setColor(QColor("red"))
+        self.scatter_cp_pos.setMarkerSize(10)
+        self.chart_cogging_profile.addSeries(self.scatter_cp_pos)
+        self.scatter_cp_pos.attachAxis(self.chart_cp_Xaxis)
+        self.scatter_cp_pos.attachAxis(self.chart_cp_Yaxis)
+
+        # Vertical position line
+        self.line_cp_vmarker = QLineSeries(self.chart_cogging_profile)
+        self.line_cp_vmarker.setName("")
+        self.line_cp_vmarker.setColor(QColor("red"))
+        pen = self.line_cp_vmarker.pen()
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.line_cp_vmarker.setPen(pen)
+        self.chart_cogging_profile.addSeries(self.line_cp_vmarker)
+        self.line_cp_vmarker.attachAxis(self.chart_cp_Xaxis)
+        self.line_cp_vmarker.attachAxis(self.chart_cp_Yaxis)
+
+        self.chart_cogging_profile.legend().setLabelBrush(QApplication.instance().palette().text())
+        for ax in self.chart_cogging_profile.axes():
+            ax.setLabelsBrush(QApplication.instance().palette().text())
+
+        self.graphWidget_Profile.setRubberBand(QChartView.RubberBand.RectangleRubberBand)
+        self.graphWidget_Profile.setChart(self.chart_cogging_profile)
+
 
         self.checkBox_advancedpid.stateChanged.connect(self.advancedPidChanged)
         self.lastPrecP = self.checkBox_P_Precision.isChecked()
@@ -247,6 +303,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.register_callback("tmc","calibrateCogging",self.coggingDetectionMsg,self.axis,str)
         self.register_callback("tmc","cogging",self.anticoggingStatus,self.axis,int,typechar='?')
         self.register_callback("tmc","coggingScale",self.coggingScaleCb,self.axis,int)
+        self.register_callback("tmc","coggingHarmonics",self.updateCoggingHarmonics,self.axis,str)
         
         self.checkBox_combineEncoders.stateChanged.connect(self.extEncoderChanged)
 
@@ -356,11 +413,16 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         
         flux = None
         cogging = None
+        pos = None
         torque = abs(tflist[0])
         if len(tflist) >= 2:
             flux = tflist[1]
         if len(tflist) >= 3:
             cogging = tflist[2]
+        if len(tflist) >= 4:
+            pos = tflist[3] / 10000.0  # normalized 0-1
+            self.cogging_position = pos
+            self.updateProfilePosition()
             
         currents = complex(torque, flux if flux is not None else 0)
         try:
@@ -760,6 +822,84 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         # Reset axes to default values
         self.chart_cogging_Yaxis.setMin(0)
         self.chart_cogging_Yaxis.setMax(10)
+        self.clearCoggingProfile()
+
+    def clearCoggingProfile(self):
+        self.cogging_harmonics_data = []
+        self.line_cp_waveform.clear()
+        self.scatter_cp_pos.clear()
+        self.line_cp_vmarker.clear()
+        self.chart_cp_Yaxis.setMin(-10)
+        self.chart_cp_Yaxis.setMax(10)
+
+    def updateCoggingHarmonics(self, data):
+        """Parse coggingHarmonics reply: 'order:amp:phase,...' and rebuild waveform."""
+        try:
+            if not data or data == "0:0:0":
+                self.cogging_harmonics_data = []
+                self.line_cp_waveform.clear()
+                self.scatter_cp_pos.clear()
+                self.line_cp_vmarker.clear()
+                return
+            
+            harmonics = []
+            for item in data.split(","):
+                parts = item.split(":")
+                if len(parts) == 3:
+                    order = int(parts[0])
+                    amp = float(parts[1])
+                    phase = float(parts[2]) / 1000.0  # phase * 1000 from firmware
+                    if amp > 0:
+                        harmonics.append((order, amp, phase))
+            
+            self.cogging_harmonics_data = harmonics
+            self.rebuildProfileWaveform()
+        except Exception as e:
+            self.main.log("TMC cogging harmonics parse error: " + str(e))
+
+    def rebuildProfileWaveform(self):
+        """Rebuild the anti-cogging waveform from harmonic data."""
+        self.line_cp_waveform.clear()
+        if not self.cogging_harmonics_data:
+            return
+        
+        max_amp = 0
+        for deg in range(0, 361):
+            theta_rad = math.radians(deg)
+            torque = 0.0
+            for order, amp, phase in self.cogging_harmonics_data:
+                torque += amp * math.sin(order * theta_rad + phase)
+            self.line_cp_waveform.append(float(deg), float(torque))
+            max_amp = max(max_amp, abs(torque))
+        
+        margin = max(max_amp * 1.2, 10)
+        self.chart_cp_Yaxis.setRange(-margin, margin)
+        
+        self.updateProfilePosition()
+
+    def updateProfilePosition(self):
+        """Update the position dot and vertical marker on the profile chart."""
+        if not self.cogging_harmonics_data:
+            return
+        
+        pos_deg = self.cogging_position * 360.0
+        theta_rad = self.cogging_position * 2.0 * math.pi
+        
+        # Compute torque at current position
+        torque = 0.0
+        for order, amp, phase in self.cogging_harmonics_data:
+            torque += amp * math.sin(order * theta_rad + phase)
+        
+        # Update position dot
+        self.scatter_cp_pos.clear()
+        self.scatter_cp_pos.append(pos_deg, torque)
+        
+        # Update vertical marker line
+        y_min = self.chart_cp_Yaxis.min()
+        y_max = self.chart_cp_Yaxis.max()
+        self.line_cp_vmarker.clear()
+        self.line_cp_vmarker.append(pos_deg, y_min)
+        self.line_cp_vmarker.append(pos_deg, y_max)
 
     def resetCoggingTable(self):
         self.send_value("tmc", "coggingTable", 0, instance=self.axis)
@@ -768,13 +908,16 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
     def reloadCoggingTable(self):
         self.clearCoggingGraph()
         self.send_command("tmc", "coggingTable", self.axis, '?')
+        self.send_command("tmc", "coggingHarmonics", self.axis, '?')
 
     def coggingScaleChanged(self, val):
         qtBlockAndCall(self.doubleSpinBox_coggScale, self.doubleSpinBox_coggScale.setValue, val / 10000.0)
+        self.send_value("tmc", "coggingScale", val=val, instance=self.axis)
 
     def coggingSpinBoxChanged(self, val):
         slider_val = int(round(val * 10000.0))
         qtBlockAndCall(self.horizontalSlider_coggmag, self.horizontalSlider_coggmag.setValue, slider_val)
+        self.send_value("tmc", "coggingScale", val=slider_val, instance=self.axis)
 
     def coggingScaleCb(self, val):
         qtBlockAndCall(self.horizontalSlider_coggmag, self.horizontalSlider_coggmag.setValue, val)

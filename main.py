@@ -288,16 +288,16 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         msg.exec()
         dfu.deleteLater()
         
-
+    """
     def changeEvent(self, event: PyQt6.QtCore.QEvent):
-        """Minimize to systray when window is minimized."""
+        #Minimize to systray when window is minimized.
         if event.type() == PyQt6.QtCore.QEvent.Type.WindowStateChange:
             if self.windowState() & PyQt6.QtCore.Qt.WindowState.WindowMinimized:
                 self.hide()
                 event.ignore()
                 return
         super().changeEvent(event)
-
+    """
     def moveEvent(self, event: PyQt6.QtGui.QMoveEvent): #pylint: disable=invalid-name
         """Move all modal dialog when moving main ui."""
         super().moveEvent(event)
