@@ -17,7 +17,7 @@
    <item>
     <widget class="QGroupBox" name="groupBox_tmc">
      <property name="title">
-      <string>TMC4671</string>
+      <string/>
      </property>
      <layout class="QGridLayout" name="gridLayout">
       <item row="6" column="2" rowspan="2">
