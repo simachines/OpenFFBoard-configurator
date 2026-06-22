@@ -1,5 +1,6 @@
 @echo off
-python main.py
+cd /d "%~dp0"
+.venv\Scripts\python.exe main.py
 
 IF %ERRORLEVEL% NEQ 0 ( 
    pause

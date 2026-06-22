@@ -46,6 +46,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.cogging_text = ""
         self.cogging_harmonics_data = []  # [(order, amplitude, phase), ...]
         self.cogging_position = 0.0  # normalized 0-1
+        self.cogging_measured_torque = 0  # initialized before first acttrq update
+        self.cogging_scale = 1.0  # default until MCU reports actual value
         self.max_datapoints = 10000
         self.max_datapointsVisibleTime = 30
         self.adc_to_amps = 0#2.5 / (0x7fff * 60.0 * 0.0015)
@@ -55,6 +57,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.versionWarningShow = True
         self.vext = 0
         self.vint = 0
+        self.vel_rpm = 0
 
         self.startTime = QTime.currentTime()
         self.chartLastX = 0
@@ -70,10 +73,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.pushButton_reloadCoggingTable.clicked.connect(self.reloadCoggingTable)
         self.pushButton_reloadCoggingTable.setVisible(False)
         self.tabWidget.currentChanged.connect(self.tabChanged)
-        self.doubleSpinBox_coggScale.setMinimum(-3.2767)
-        self.doubleSpinBox_coggScale.setMaximum(3.2767)
-        self.doubleSpinBox_coggScale.setSingleStep(0.001)
-        self.doubleSpinBox_coggScale.setDecimals(4)
+        # Hide magnitude slider/spinbox (wired through .ui file)
+        self.horizontalSlider_coggmag.hide()
+        self.doubleSpinBox_coggScale.hide()
         #self.initUi()
 
         self.pushButton_scaleTune = QPushButton("Manual Tuning")
@@ -197,12 +199,10 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 
         self.chart_cp_Xaxis = QValueAxis(self.chart_cogging_profile)
         self.chart_cp_Xaxis.setRange(0, 360)
-        self.chart_cp_Xaxis.setTitleText("Position (deg)")
         self.chart_cp_Xaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),128))
         self.chart_cogging_profile.addAxis(self.chart_cp_Xaxis, Qt.AlignmentFlag.AlignBottom)
 
         self.chart_cp_Yaxis = QValueAxis(self.chart_cogging_profile)
-        self.chart_cp_Yaxis.setTitleText("Torque")
         self.chart_cp_Yaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
         self.chart_cogging_profile.setBackgroundBrush(QApplication.instance().palette().window())
         self.chart_cogging_profile.addAxis(self.chart_cp_Yaxis, Qt.AlignmentFlag.AlignLeft)
@@ -490,8 +490,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             cogging = tflist[2]
             self.cogging_measured_torque = cogging
         if len(tflist) >= 4:
-            self.cogging_scale = int(tflist[3]) / 100.0  # scale*100 from MCU
-            self.horizontalSlider_coggmag.setValue(int(self.cogging_scale * 10000.0))
+            self.cogging_scale = int(tflist[3]) / 100.0  # scale*100 from MCU (read-only)
         if len(tflist) >= 5:
             pos = tflist[4] / 10000.0  # normalized 0-1
             self.cogging_position = pos
@@ -499,6 +498,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         vel_rpm = 0
         if len(tflist) >= 6:
             vel_rpm = int(tflist[5])  # velocity RPM from MCU
+        self.vel_rpm = vel_rpm
             
         currents = complex(torque, flux if flux is not None else 0)
         try:
@@ -653,9 +653,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.send_value("tmc","combineEncoder",val = 1 if self.checkBox_combineEncoders.isChecked() else 0,instance=self.axis)
         self.send_value("tmc","invertForce",val = 1 if self.checkBox_invertForce.isChecked() else 0,instance=self.axis)
         self.send_value("tmc","cogging",val = 1 if self.checkBox_cogging.isChecked() else 0,instance=self.axis)
-        self.send_value("tmc","coggingScale",val=self.horizontalSlider_coggmag.value(),instance=self.axis)
-        self.send_value("tmc","coggingShape",val=int(round(self.spinBox_waveshape.value() * 100.0)),instance=self.axis)
-        
     def submitPid(self):
         # PIDs
         seq = 1 if self.checkBox_advancedpid.isChecked() else 0
@@ -755,8 +752,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 self.pushButton_submitpid.clicked.connect(self.submitPid)
                 self.comboBox_torqueFilter.currentIndexChanged.connect(self.torqueFilterChanged)
                 self.spinBox_torqueFilterFreq.valueChanged.connect(lambda x : self.send_value("tmc","trqbq_f",x,instance=self.axis))
-                self.horizontalSlider_coggmag.valueChanged.connect(self.coggingScaleChanged)
-                self.doubleSpinBox_coggScale.valueChanged.connect(self.coggingSpinBoxChanged)
                 self.init_done = True
 
             # Check if calibrated
@@ -1160,28 +1155,15 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.send_command("tmc", "coggingHarmonics", self.axis, '?')
         self.send_command("tmc", "coggingCwCcw", self.axis, '?')
 
-    def coggingScaleChanged(self, val):
-        qtBlockAndCall(self.doubleSpinBox_coggScale, self.doubleSpinBox_coggScale.setValue, val / 10000.0)
-        self.send_value("tmc", "coggingScale", val=val, instance=self.axis)
-
-    def coggingSpinBoxChanged(self, val):
-        slider_val = int(round(val * 10000.0))
-        qtBlockAndCall(self.horizontalSlider_coggmag, self.horizontalSlider_coggmag.setValue, slider_val)
-        self.send_value("tmc", "coggingScale", val=slider_val, instance=self.axis)
-
     def coggingScaleCb(self, val):
-        qtBlockAndCall(self.horizontalSlider_coggmag, self.horizontalSlider_coggmag.setValue, val)
-        qtBlockAndCall(self.doubleSpinBox_coggScale, self.doubleSpinBox_coggScale.setValue, val / 10000.0)
+        pass  # magnitude slider removed; scale now read-only on TMC tab
 
     def openScaleCurveDialog(self):
         dlg = ScalePhaseAdvanceDialog(self, self.axis)
         dlg.exec()
 
-    def waveshapeChanged(self, val):
-        self.send_value("tmc", "coggingShape", val=int(round(val * 100.0)), instance=self.axis)
-
     def coggingShapeCb(self, val):
-        qtBlockAndCall(self.spinBox_waveshape, self.spinBox_waveshape.setValue, val / 100.0)
+        pass  # waveshape widget removed; shaping now handled by HarmShapingTab
 
     def getMotor(self):
         commands=["mtype","poles","encsrc","cpr","abnindex","abnpol","combineEncoder","invertForce","fluxbrake","calibrated"]
@@ -1207,11 +1189,18 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 class CurveEditorTab(QWidget):
     """One editable speed-dependent curve: a chart with a live RPM dot plus per-RPM spinboxes.
 
-    Shared by the Scale Curve and Phase Advance tabs. Values are sent to the MCU
-    automatically whenever a spinbox changes; the curve is fetched from the MCU on open.
+    Sliders
+    - Left vertical:  first-point value (beginning of graph), maps 0–100 → y_min..y_max
+    - Right vertical: last-point value (end of graph), same mapping
+    - Knee horizontal: RPM breakpoint below which the curve is flattened to a plateau
+      (snaps to actual RPM_POINTS values: 3,5,7,10,12,15…256)
+
+    Shaping pipeline (non-compounding): base → remap between begin/end → knee flatten → clamp.
+    Values are sent to the MCU automatically when a spinbox changes; the curve is
+    fetched from the MCU on open.
     """
     # RPM breakpoints shared with firmware (must match scale_curve_rpm_defaults)
-    RPM_POINTS = [3,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256]
+    RPM_POINTS = [0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256]
 
     def __init__(self, tmc_ui, axis, cmd_name, y_label, y_min, y_max, y_step, scale, decimals):
         """
@@ -1225,18 +1214,23 @@ class CurveEditorTab(QWidget):
         self.scale = float(scale)
         self._y_min = float(y_min)
         self._y_max = float(y_max)
-        self._loading = False    # suppress handlers while programmatically updating spinboxes
-        self._slider_syncing = False  # guard against recursive slider cross-sync
+        self._loading = False      # suppress handlers while programmatically updating spinboxes
+        self._shaping_sync = False # guard against recursive slider cross-sync
 
-        # Shaping state. Both the scale sliders and the knee slider re-derive the
-        # visible spinbox values from `base_values`, so dragging never compounds.
+        # Shaping state — all sliders derive visible spinbox values from these.
         self.base_values = [0.0] * len(self.RPM_POINTS)
-        self.current_mult = 1.0   # global vertical multiplier applied to all points
-        self.knee_rpm = 0         # RPM breakpoint below which the curve is flattened
+        self.target_begin = 0.0   # desired value at first RPM (from left vertical slider)
+        self.target_end = 0.0     # desired value at last RPM (from right vertical slider)
+        self.knee_idx = 0         # breakpoint INDEX below which curve is flattened (0 = no flattening)
+        self._slider_dragging = False  # true while a slider is being dragged
+        self._send_debounce = QTimer(self)
+        self._send_debounce.setSingleShot(True)
+        self._send_debounce.setInterval(250)
+        self._send_debounce.timeout.connect(self._debounced_send)
 
         layout = QVBoxLayout(self)
 
-        # Chart
+        # ---- Chart ----
         self.chart = QChart()
         self.chart.setMargins(QMargins(2,2,2,2))
         self.chart.legend().hide()
@@ -1255,9 +1249,12 @@ class CurveEditorTab(QWidget):
         self.curve_series.attachAxis(self.axisX)
         self.curve_series.attachAxis(self.axisY)
 
-        # Vertical marker showing the current knee RPM
+        # Vertical knee marker (bright yellow so it's clearly visible when dragged)
         self.knee_series = QLineSeries()
-        self.knee_series.setColor(QColor(255, 255, 255, 90))
+        self.knee_series.setColor(QColor(255, 220, 0, 200))
+        pen = self.knee_series.pen()
+        pen.setWidth(2)
+        self.knee_series.setPen(pen)
         self.knee_series.append(0, y_min)
         self.knee_series.append(0, y_max)
         self.chart.addSeries(self.knee_series)
@@ -1274,54 +1271,77 @@ class CurveEditorTab(QWidget):
         self.chartView = QChartView(self.chart)
         self.chartView.setMinimumHeight(220)
 
-        # Chart row: [scale-down slider] [chart] [scale-up slider]
+        # ---- Chart row: [begin-point slider] [chart] [end-point slider] ----
         chart_row = QHBoxLayout()
-        # Left vertical slider (beginning of graph): shrink whole curve toward 0 (0–100%)
+
+        # Left vertical — first RPM point value
         left_col = QVBoxLayout()
-        left_col.addWidget(QLabel("Scale ▼"), 0, Qt.AlignmentFlag.AlignHCenter)
-        self.slider_left = QSlider(Qt.Orientation.Vertical)
-        self.slider_left.setRange(0, 100)
-        self.slider_left.setValue(100)
-        self.slider_left.setMinimumHeight(200)
-        self.slider_left.valueChanged.connect(self._on_left_slider)
-        self.slider_left.sliderReleased.connect(lambda: self._apply_shaping(send=True))
-        left_col.addWidget(self.slider_left, 1)
-        left_col.addWidget(QLabel("0%"), 0, Qt.AlignmentFlag.AlignHCenter)
+        left_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_col.addWidget(QLabel("Begin"), 0, Qt.AlignmentFlag.AlignHCenter)
+        self.slider_begin = QSlider(Qt.Orientation.Vertical)
+        self.slider_begin.setRange(0, 100)
+        self.slider_begin.setValue(50)
+        self.slider_begin.setMinimumHeight(180)
+        self.slider_begin.sliderPressed.connect(lambda: self._on_slider_press())
+        self.slider_begin.valueChanged.connect(self._on_begin_slider)
+        self.slider_begin.sliderReleased.connect(self._on_slider_release)
+        left_col.addWidget(self.slider_begin, 1)
+        self.spin_begin = QDoubleSpinBox()
+        self.spin_begin.setRange(y_min, y_max)
+        self.spin_begin.setDecimals(decimals)
+        self.spin_begin.setSingleStep(y_step)
+        self.spin_begin.setValue(0.0)
+        self.spin_begin.valueChanged.connect(self._on_begin_spin)
+        left_col.addWidget(self.spin_begin, 0)
         chart_row.addLayout(left_col)
 
         chart_row.addWidget(self.chartView, 1)
 
-        # Right vertical slider (end of graph): amplify whole curve (100–300%)
+        # Right vertical — last RPM point value
         right_col = QVBoxLayout()
-        right_col.addWidget(QLabel("Scale ▲"), 0, Qt.AlignmentFlag.AlignHCenter)
-        self.slider_right = QSlider(Qt.Orientation.Vertical)
-        self.slider_right.setRange(100, 300)
-        self.slider_right.setValue(100)
-        self.slider_right.setMinimumHeight(200)
-        self.slider_right.valueChanged.connect(self._on_right_slider)
-        self.slider_right.sliderReleased.connect(lambda: self._apply_shaping(send=True))
-        right_col.addWidget(self.slider_right, 1)
-        right_col.addWidget(QLabel("300%"), 0, Qt.AlignmentFlag.AlignHCenter)
+        right_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right_col.addWidget(QLabel("End"), 0, Qt.AlignmentFlag.AlignHCenter)
+        self.slider_end = QSlider(Qt.Orientation.Vertical)
+        self.slider_end.setRange(0, 100)
+        self.slider_end.setValue(50)
+        self.slider_end.setMinimumHeight(180)
+        self.slider_end.sliderPressed.connect(lambda: self._on_slider_press())
+        self.slider_end.valueChanged.connect(self._on_end_slider)
+        self.slider_end.sliderReleased.connect(self._on_slider_release)
+        right_col.addWidget(self.slider_end, 1)
+        self.spin_end = QDoubleSpinBox()
+        self.spin_end.setRange(y_min, y_max)
+        self.spin_end.setDecimals(decimals)
+        self.spin_end.setSingleStep(y_step)
+        self.spin_end.setValue(0.0)
+        self.spin_end.valueChanged.connect(self._on_end_spin)
+        right_col.addWidget(self.spin_end, 0)
         chart_row.addLayout(right_col)
         layout.addLayout(chart_row)
 
-        # Horizontal knee slider: start-RPM breakpoint that flattens the low-RPM plateau
+        # ---- Knee RPM slider (horizontal, snaps to actual RPM breakpoints) ----
         knee_row = QHBoxLayout()
         knee_row.addWidget(QLabel("Knee RPM:"))
         self.slider_knee = QSlider(Qt.Orientation.Horizontal)
-        self.slider_knee.setRange(0, int(self.RPM_POINTS[-1]))
+        self.slider_knee.setRange(0, len(self.RPM_POINTS) - 1)
         self.slider_knee.setValue(0)
+        self.slider_knee.sliderPressed.connect(lambda: self._on_slider_press())
         self.slider_knee.valueChanged.connect(self._on_knee_slider)
-        self.slider_knee.sliderReleased.connect(lambda: self._apply_shaping(send=True))
+        self.slider_knee.sliderReleased.connect(self._on_slider_release)
         knee_row.addWidget(self.slider_knee, 1)
-        self.lbl_knee = QLabel("0 (none)")
-        knee_row.addWidget(self.lbl_knee)
+        self.spin_knee = QSpinBox()
+        self.spin_knee.setRange(0, self.RPM_POINTS[-1])
+        self.spin_knee.setValue(0)
+        self.spin_knee.setSuffix(" RPM")
+        self.spin_knee.valueChanged.connect(self._on_knee_spin)
+        knee_row.addWidget(self.spin_knee)
         layout.addLayout(knee_row)
 
-        self.lbl_status = QLabel("Scale: 100%   |   Knee: 0 RPM")
+        # Status line
+        self.lbl_status = QLabel("Begin: --   End: --   Knee: 0 RPM")
         layout.addWidget(self.lbl_status)
 
-        # Spinboxes in a grid (label + value), wrapped into a scroll area
+        # ---- Spinboxes grid in scroll area ----
         spin_container = QWidget()
         grid = QGridLayout(spin_container)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -1344,62 +1364,124 @@ class CurveEditorTab(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         layout.addWidget(scroll)
 
-        # Redraw the static curve from the spinbox values
         self.redraw_curve()
 
-    # ---- Shaping (sliders) ----
-    def _on_left_slider(self, val):
-        """Scale-DOWN slider (0–100% => mult 0.0–1.0). Snaps the up-slider to neutral."""
-        if self._slider_syncing:
-            return
-        self._slider_syncing = True
-        self.slider_right.blockSignals(True)
-        self.slider_right.setValue(100)
-        self.slider_right.blockSignals(False)
-        self._slider_syncing = False
-        self.current_mult = val / 100.0
-        self._apply_shaping(send=False)
+    # ---- Slider drag / debounce ----
+    def _on_slider_press(self):
+        self._slider_dragging = True
+        self._send_debounce.stop()
 
-    def _on_right_slider(self, val):
-        """Scale-UP slider (100–300% => mult 1.0–3.0). Snaps the down-slider to neutral."""
-        if self._slider_syncing:
+    def _on_slider_release(self):
+        self._slider_dragging = False
+        self._send_debounce.stop()
+        self._apply_shaping(send=True)
+
+    def _debounced_send(self):
+        """Fire after 250ms quiet — sends if slider is still at rest (no drag)."""
+        if not self._slider_dragging:
+            self._apply_shaping(send=True)
+
+    # ---- Slider helpers ----
+    def _slider_to_value(self, slider_val):
+        """Map 0–100 slider integer → y_min..y_max."""
+        return self._y_min + (slider_val / 100.0) * (self._y_max - self._y_min)
+
+    def _value_to_slider(self, val):
+        """Map y_min..y_max value → 0–100 slider integer."""
+        span = self._y_max - self._y_min
+        if span <= 0:
+            return 0
+        return int(round((val - self._y_min) / span * 100.0))
+
+    # ---- Slider callbacks ----
+    def _on_begin_slider(self, val):
+        """Target value for the first RPM point. Whole curve remaps between begin–end."""
+        if self._shaping_sync:
             return
-        self._slider_syncing = True
-        self.slider_left.blockSignals(True)
-        self.slider_left.setValue(100)
-        self.slider_left.blockSignals(False)
-        self._slider_syncing = False
-        self.current_mult = val / 100.0
+        self.target_begin = self._slider_to_value(val)
         self._apply_shaping(send=False)
+        if not self._slider_dragging:
+            self._send_debounce.start()
+
+    def _on_end_slider(self, val):
+        """Target value for the last RPM point. Whole curve remaps between begin–end."""
+        if self._shaping_sync:
+            return
+        self.target_end = self._slider_to_value(val)
+        self._apply_shaping(send=False)
+        if not self._slider_dragging:
+            self._send_debounce.start()
+
+    def _on_begin_spin(self, val):
+        """Begin spinbox edited: snap slider and apply."""
+        if self._shaping_sync:
+            return
+        self.target_begin = float(val)
+        self._apply_shaping(send=True)
+
+    def _on_end_spin(self, val):
+        """End spinbox edited: snap slider and apply."""
+        if self._shaping_sync:
+            return
+        self.target_end = float(val)
+        self._apply_shaping(send=True)
 
     def _on_knee_slider(self, val):
-        """Knee RPM: flatten all breakpoints below this RPM into a plateau."""
-        self.knee_rpm = float(val)
+        """Knee slider position == breakpoint index. 0 = no flattening."""
+        if self._shaping_sync:
+            return
+        self.knee_idx = int(val)
         self._apply_shaping(send=False)
+        if not self._slider_dragging:
+            self._send_debounce.start()
 
+    def _on_knee_spin(self, val):
+        """Knee RPM typed: find nearest breakpoint index and snap slider."""
+        if self._shaping_sync:
+            return
+        # Find the breakpoint index whose RPM is closest to typed value
+        rpm_val = int(val)
+        best_idx = 0
+        best_dist = abs(rpm_val - 0)
+        for i, r in enumerate(self.RPM_POINTS):
+            d = abs(rpm_val - r)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        self.knee_idx = best_idx
+        self._apply_shaping(send=True)
+
+    # ---- Shaping pipeline ----
     def _apply_shaping(self, send=False):
-        """Recompute visible spinbox values from base_values with knee + global scale.
+        """Recompute visible spinbox values as a plateau + linear ramp defined by the sliders.
 
-        Pipeline (non-compounding): start from base -> flatten low-RPM plateau to the
-        value at the knee breakpoint -> multiply by current_mult -> clamp to Y range.
-        If send=True, push all points to the MCU.
+        Model (sliders fully define the shape; base curve shape is not preserved):
+          - Points with index < knee_idx: flat at target_begin
+          - Points with index >= knee_idx: linear ramp from target_begin to target_end
+        Clamp to Y range.  If send=True, push all points to the MCU.
         """
         if not self.base_values:
             return
-        # First breakpoint at/above the knee RPM defines the plateau value.
-        knee_idx = len(self.RPM_POINTS) - 1
-        for i, r in enumerate(self.RPM_POINTS):
-            if r >= self.knee_rpm:
-                knee_idx = i
-                break
-        plateau = self.base_values[knee_idx]
+
+        N = len(self.RPM_POINTS)
+        knee_idx = max(0, min(self.knee_idx, N - 1))
+        rpm_knee = self.RPM_POINTS[knee_idx]
+        rpm_last = self.RPM_POINTS[-1]
+        rpm_span = rpm_last - rpm_knee  # RPM range covered by the ramp region
 
         self._loading = True
         for i, sb in enumerate(self.spinboxes):
-            v = self.base_values[i]
+            rpm_i = self.RPM_POINTS[i]
             if i < knee_idx:
-                v = plateau
-            v *= self.current_mult
+                v = self.target_begin                       # plateau below knee
+            else:
+                if rpm_span <= 0:
+                    # knee at the very last point: only that point takes target_end
+                    v = self.target_end if i == N - 1 else self.target_begin
+                else:
+                    # Linear interpolation based on actual RPM, not point index
+                    t = (rpm_i - rpm_knee) / rpm_span       # 0 at knee RPM → 1 at last RPM
+                    v = self.target_begin + t * (self.target_end - self.target_begin)
             v = max(self._y_min, min(self._y_max, v))
             sb.setValue(v)
         self._loading = False
@@ -1409,38 +1491,70 @@ class CurveEditorTab(QWidget):
                 self.tmc_ui.send_value("tmc", self.cmd_name, adr=i,
                                        val=int(round(sb.value() * self.scale)), instance=self.axis)
 
+        self._sync_vertical_sliders()
         self._update_knee_marker()
         self.redraw_curve()
         self._update_status()
 
+    def _sync_vertical_sliders(self):
+        """Push target_begin/target_end/knee_idx back to slider positions and spinboxes."""
+        self._shaping_sync = True
+        self.slider_begin.blockSignals(True)
+        self.slider_end.blockSignals(True)
+        self.slider_knee.blockSignals(True)
+        self.spin_begin.blockSignals(True)
+        self.spin_end.blockSignals(True)
+        self.spin_knee.blockSignals(True)
+        self.slider_begin.setValue(self._value_to_slider(self.target_begin))
+        self.slider_end.setValue(self._value_to_slider(self.target_end))
+        self.slider_knee.setValue(self.knee_idx)
+        self.spin_begin.setValue(self.target_begin)
+        self.spin_end.setValue(self.target_end)
+        self.spin_knee.setValue(self.RPM_POINTS[self.knee_idx])
+        self.slider_begin.blockSignals(False)
+        self.slider_end.blockSignals(False)
+        self.slider_knee.blockSignals(False)
+        self.spin_begin.blockSignals(False)
+        self.spin_end.blockSignals(False)
+        self.spin_knee.blockSignals(False)
+        self._shaping_sync = False
+
     def _update_knee_marker(self):
-        """Draw/refresh the vertical knee marker line at the current knee RPM."""
         self.knee_series.clear()
-        self.knee_series.append(self.knee_rpm, self._y_min)
-        self.knee_series.append(self.knee_rpm, self._y_max)
+        knee_rpm = self.RPM_POINTS[self.knee_idx]
+        self.knee_series.append(knee_rpm, self._y_min)
+        self.knee_series.append(knee_rpm, self._y_max)
 
     def _update_status(self):
-        pct = int(round(self.current_mult * 100.0))
-        knee_txt = f"{int(round(self.knee_rpm))}" if self.knee_rpm > 0 else "0 (none)"
-        self.lbl_status.setText(f"Scale: {pct}%   |   Knee: {knee_txt} RPM")
-        self.lbl_knee.setText(knee_txt)
+        begin_txt = f"{self.target_begin:.2f}" if self.base_values else "--"
+        end_txt = f"{self.target_end:.2f}" if self.base_values else "--"
+        knee_rpm = self.RPM_POINTS[self.knee_idx]
+        knee_txt = f"{knee_rpm}" if self.knee_idx > 0 else "none"
+        self.lbl_status.setText(
+            f"Begin: {begin_txt}   End: {end_txt}   Knee: {knee_txt} RPM")
 
     def _reset_shaping_sliders(self):
-        """Return all three sliders to neutral without firing handlers."""
-        self._slider_syncing = True
-        for s in (self.slider_left, self.slider_right, self.slider_knee):
+        """Return all sliders and spinboxes to neutral without firing handlers."""
+        self._shaping_sync = True
+        for s in (self.slider_begin, self.slider_end, self.slider_knee,
+                  self.spin_begin, self.spin_end, self.spin_knee):
             s.blockSignals(True)
-        self.slider_left.setValue(100)
-        self.slider_right.setValue(100)
-        self.slider_knee.setValue(0)
-        for s in (self.slider_left, self.slider_right, self.slider_knee):
+        self.slider_begin.setValue(self._value_to_slider(self.target_begin))
+        self.slider_end.setValue(self._value_to_slider(self.target_end))
+        self.slider_knee.setValue(self.knee_idx)
+        self.spin_begin.setValue(self.target_begin)
+        self.spin_end.setValue(self.target_end)
+        self.spin_knee.setValue(self.RPM_POINTS[self.knee_idx])
+        for s in (self.slider_begin, self.slider_end, self.slider_knee,
+                  self.spin_begin, self.spin_end, self.spin_knee):
             s.blockSignals(False)
-        self._slider_syncing = False
+        self._shaping_sync = False
 
+    # ---- Data I/O ----
     def set_values(self, float_values):
         """Populate spinboxes from a list of float values (len == RPM_POINTS) without sending.
 
-        Also takes this as the new shaping base and neutralizes any active shaping.
+        Snapshots this as the new shaping base and sets targets to match actual endpoints.
         """
         self._loading = True
         for i, sb in enumerate(self.spinboxes):
@@ -1448,8 +1562,10 @@ class CurveEditorTab(QWidget):
                 sb.setValue(float(float_values[i]))
         self._loading = False
         self.base_values = [sb.value() for sb in self.spinboxes]
-        self.current_mult = 1.0
-        self.knee_rpm = 0.0
+        # Targets match the loaded curve endpoints (neutral shaping)
+        self.target_begin = self.base_values[0] if self.base_values else 0.0
+        self.target_end = self.base_values[-1] if self.base_values else 0.0
+        self.knee_idx = 0
         self._reset_shaping_sliders()
         self._update_knee_marker()
         self.redraw_curve()
@@ -1458,15 +1574,16 @@ class CurveEditorTab(QWidget):
     def _on_spin_changed(self, idx, val):
         if self._loading:
             return
-        # A manual spinbox edit is authoritative: snapshot the whole visible curve
-        # as the new base and neutralize shaping so it cannot compound afterwards.
+        # A manual spinbox edit is authoritative: re-snapshot base and neutralize shaping.
         self.base_values = [sb.value() for sb in self.spinboxes]
-        self.current_mult = 1.0
-        self.knee_rpm = 0.0
+        self.target_begin = self.base_values[0] if self.base_values else 0.0
+        self.target_end = self.base_values[-1] if self.base_values else 0.0
+        self.knee_idx = 0
         self._reset_shaping_sliders()
         self._update_knee_marker()
         # Auto-send the edited point to MCU (integer encoded)
-        self.tmc_ui.send_value("tmc", self.cmd_name, adr=idx, val=int(round(val * self.scale)), instance=self.axis)
+        self.tmc_ui.send_value("tmc", self.cmd_name, adr=idx,
+                               val=int(round(val * self.scale)), instance=self.axis)
         self.redraw_curve()
         self._update_status()
 
@@ -1476,13 +1593,11 @@ class CurveEditorTab(QWidget):
             self.curve_series.append(self.RPM_POINTS[i], sb.value())
 
     def set_live_rpm(self, rpm):
-        """Move the live dot to (rpm, interpolated_value)."""
         val = self.interpolate(rpm)
         self.dot_series.clear()
         self.dot_series.append(rpm, val)
 
     def interpolate(self, rpm):
-        """Client-side linear interpolation of the current spinbox values at a given RPM."""
         pts = self.RPM_POINTS
         vals = [sb.value() for sb in self.spinboxes]
         if rpm <= pts[0]:
@@ -1495,6 +1610,238 @@ class CurveEditorTab(QWidget):
                 t = (rpm - pts[i]) / span
                 return vals[i] + t * (vals[i + 1] - vals[i])
         return vals[-1]
+
+
+class HarmShapingTab(QWidget):
+    """Editor for the cogging waveshaping ("3rd harmonic") parameters.
+
+    Lets the user subtract/add a harmonic of the DOMINANT detected cogging order
+    to reshape the compensation profile (thin peaks / steep slopes) so it matches
+    the physical stator-tooth feel better than the raw Fourier sum.
+
+    Firmware command `coggingH3` (setat): adr 0 = shaping(*1000), 1 = phase trim
+    (mrad), 2 = mult (1..31). get returns "shaping:phaseTrim:mult".
+
+    The chart previews one revolution of the original cogging compensation (from
+    the cached harmonic table) versus the shaped wave, so the effect is visible.
+    """
+
+    def __init__(self, tmc_ui, axis):
+        super().__init__()
+        self.tmc_ui = tmc_ui
+        self.axis = axis
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+
+        # ---- Chart ----
+        self.chart = QChart()
+        self.chart.setMargins(QMargins(2, 2, 2, 2))
+        self.chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        self.axisX = QValueAxis()
+        self.axisX.setTitleText("Angle (deg)")
+        self.axisX.setRange(0, 360)
+        self.axisY = QValueAxis()
+        self.axisY.setTitleText("Compensation")
+        self.chart.addAxis(self.axisX, Qt.AlignmentFlag.AlignBottom)
+        self.chart.addAxis(self.axisY, Qt.AlignmentFlag.AlignLeft)
+
+        self.orig_series = QLineSeries()
+        self.orig_series.setName("Original")
+        self.orig_series.setColor(QColor("#3daee9"))
+        self.chart.addSeries(self.orig_series)
+        self.orig_series.attachAxis(self.axisX)
+        self.orig_series.attachAxis(self.axisY)
+
+        self.shaped_series = QLineSeries()
+        self.shaped_series.setName("Shaped")
+        self.shaped_series.setColor(QColor("#da4453"))
+        self.chart.addSeries(self.shaped_series)
+        self.shaped_series.attachAxis(self.axisX)
+        self.shaped_series.attachAxis(self.axisY)
+
+        self.chartView = QChartView(self.chart)
+        self.chartView.setMinimumHeight(240)
+        layout.addWidget(self.chartView, 1)
+
+        # ---- Controls ----
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Shaping factor (slider + spinbox): signed fraction of dominant amplitude.
+        self.slider_shaping = QSlider(Qt.Orientation.Horizontal)
+        self.slider_shaping.setRange(-100, 100)  # -1.00 .. +1.00 in steps of 0.01
+        self.slider_shaping.setValue(0)
+        self.slider_shaping.valueChanged.connect(self._on_shaping_slider)
+        shaping_row = QHBoxLayout()
+        shaping_row.addWidget(self.slider_shaping, 1)
+        self.spin_shaping = QDoubleSpinBox()
+        self.spin_shaping.setRange(-1.0, 1.0)
+        self.spin_shaping.setSingleStep(0.01)
+        self.spin_shaping.setDecimals(3)
+        self.spin_shaping.setSuffix("")
+        self.spin_shaping.valueChanged.connect(self._on_shaping_spin)
+        shaping_row.addWidget(self.spin_shaping)
+        shaping_w = QWidget()
+        shaping_w.setLayout(shaping_row)
+        form.addRow("Shaping (+ = subtract, thin peaks):", shaping_w)
+
+        # Harmonic multiplier of the dominant order (2,3,5...).
+        self.spin_mult = QSpinBox()
+        self.spin_mult.setRange(1, 31)
+        self.spin_mult.setValue(3)
+        self.spin_mult.valueChanged.connect(self._on_mult_changed)
+        form.addRow("Harmonic multiplier (3 = 3rd):", self.spin_mult)
+
+        # Phase trim in degrees — rotates the applied shaping harmonic around the
+        # electrical angle. This shifts where along the revolution the peak‑shaving
+        # effect lands, letting you align it precisely with the physical detent position.
+        self.spin_phase = QDoubleSpinBox()
+        self.spin_phase.setRange(-180.0, 180.0)
+        self.spin_phase.setSingleStep(1.0)
+        self.spin_phase.setDecimals(2)
+        self.spin_phase.setSuffix(" deg")
+        self.spin_phase.setValue(0.0)
+        self.spin_phase.setToolTip("Rotates the shaped harmonic around the electrical revolution "
+                                   "so the peak‑shaving effect aligns with the physical detents")
+        self.spin_phase.valueChanged.connect(self._on_phase_changed)
+        form.addRow("Phase trim:", self.spin_phase)
+
+        # Read-only info about the detected dominant harmonic.
+        self.label_dom = QLabel("Dominant order: —")
+        form.addRow("", self.label_dom)
+
+        layout.addLayout(form)
+
+        self._load_from_mcu()
+
+    # ---------- loading ----------
+    def _load_from_mcu(self):
+        self.tmc_ui.get_value_async("tmc", "coggingH3", self._h3_cb, self.axis, str)
+
+    def _h3_cb(self, data):
+        try:
+            parts = str(data).split(":")
+            if len(parts) >= 3:
+                shaping = float(int(parts[0])) / 1000.0
+                phase_mrad = float(int(parts[1]))
+                mult = int(parts[2])
+                self._loading = True
+                self.spin_shaping.setValue(shaping)
+                self.spin_phase.setValue(phase_mrad / 1000.0 * 180.0 / math.pi)
+                if 1 <= mult <= 31:
+                    self.spin_mult.setValue(mult)
+                self.slider_shaping.setValue(int(round(shaping * 100)))
+                self._loading = False
+        except Exception:
+            self._loading = False
+        self.redraw()
+
+    # ---------- handlers ----------
+    def _on_shaping_slider(self, val):
+        if self._loading:
+            return
+        v = val / 100.0
+        qtBlockAndCall(self.spin_shaping, self.spin_shaping.setValue, v)
+        self._send(0, int(round(v * 1000.0)))
+        self.redraw()
+
+    def _on_shaping_spin(self, val):
+        if self._loading:
+            return
+        qtBlockAndCall(self.slider_shaping, self.slider_shaping.setValue, int(round(val * 100)))
+        self._send(0, int(round(val * 1000.0)))
+        self.redraw()
+
+    def _on_mult_changed(self, val):
+        if self._loading:
+            return
+        self._send(2, int(val))
+        self.redraw()
+
+    def _on_phase_changed(self, val):
+        if self._loading:
+            return
+        # degrees -> millirad
+        mrad = int(round(val * math.pi / 180.0 * 1000.0))
+        self._send(1, mrad)
+        self.redraw()
+
+    def _send(self, adr, val):
+        self.tmc_ui.send_value("tmc", "coggingH3", val=val, adr=adr, instance=self.axis)
+
+    # ---------- preview ----------
+    def _dominant_harmonic(self):
+        """Return (order, amp, phase_rad) of the largest cached cogging harmonic, or None."""
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        best = None
+        for h in harms:
+            try:
+                order, amp, phase_rad = int(h[0]), float(h[1]), float(h[2])
+            except Exception:
+                continue
+            if amp > 0 and (best is None or amp > best[1]):
+                best = (order, amp, phase_rad)
+        return best
+
+    def redraw(self):
+        dom = self._dominant_harmonic()
+        mult = self.spin_mult.value()
+        if dom is not None:
+            actual_order = dom[0] * mult
+            self.label_dom.setText(f"Dominant order: {dom[0]}  →  editing order {actual_order}  (amp {dom[1]:.0f})")
+        else:
+            self.label_dom.setText("Dominant order: —  (no harmonic table cached)")
+
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        shaping = self.spin_shaping.value()
+        mult = self.spin_mult.value()
+        phase_trim_rad = self.spin_phase.value() * math.pi / 180.0
+
+        # Reconstruct original and shaped waves over one revolution.
+        N = 360
+        orig = [0.0] * N
+        shaped = [0.0] * N
+        have_data = False
+        for h in harms:
+            try:
+                order, amp, phase_rad = int(h[0]), float(h[1]), float(h[2])
+            except Exception:
+                continue
+            if amp <= 0:
+                continue
+            have_data = True
+            for i in range(N):
+                theta = (i / N) * 2.0 * math.pi
+                orig[i] += amp * math.sin(order * theta + phase_rad)
+
+        if not have_data:
+            self.orig_series.clear()
+            self.shaped_series.clear()
+            return
+
+        # Apply shaping term using the dominant harmonic.
+        for i in range(N):
+            theta = (i / N) * 2.0 * math.pi
+            v = orig[i]
+            if dom is not None and shaping != 0.0:
+                d_order, d_amp, d_phase_rad = dom
+                shaped_arg = mult * (d_order * theta + d_phase_rad) + phase_trim_rad
+                v -= shaping * d_amp * math.sin(shaped_arg)
+            shaped[i] = v
+
+        self.orig_series.clear()
+        self.shaped_series.clear()
+        y_min = min(min(orig), min(shaped))
+        y_max = max(max(orig), max(shaped))
+        if y_max - y_min < 1e-6:
+            y_max = y_min + 1.0
+        pad = (y_max - y_min) * 0.1
+        self.axisY.setRange(y_min - pad, y_max + pad)
+        for i in range(N):
+            deg = i  # 0..359
+            self.orig_series.append(deg, orig[i])
+            self.shaped_series.append(deg, shaped[i])
 
 
 class ScalePhaseAdvanceDialog(QDialog):
@@ -1516,15 +1863,19 @@ class ScalePhaseAdvanceDialog(QDialog):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
-        # Scale Curve tab: value range 0..3, MCU encodes *1000
+        # Scale Curve tab: value range 0..10, MCU encodes *1000
         self.scale_tab = CurveEditorTab(
-            tmc_ui, axis, "scaleCurve", "Scale", 0.0, 3.0, 0.05, scale=1000.0, decimals=3)
+            tmc_ui, axis, "scaleCurve", "Scale", 0.0, 10.0, 0.1, scale=1000.0, decimals=2)
         self.tabs.addTab(self.scale_tab, "Scale Curve")
 
         # Phase Advance tab: value in degrees, MCU encodes *100
         self.phase_tab = CurveEditorTab(
-            tmc_ui, axis, "phaseAdvCurve", "Phase Advance (deg)", -10.0, 45.0, 0.5, scale=100.0, decimals=2)
+            tmc_ui, axis, "phaseAdvCurve", "Phase Advance (deg)", -5.0, 15.0, 0.25, scale=100.0, decimals=2)
         self.tabs.addTab(self.phase_tab, "Phase Advance")
+
+        # 3rd-harmonic waveshaping tab: reshapes the cogging compensation profile.
+        self.h3_tab = HarmShapingTab(tmc_ui, axis)
+        self.tabs.addTab(self.h3_tab, "Harmonic Editor")
 
         # Live RPM dot polling
         self.live_timer = QTimer(self)
@@ -1536,15 +1887,24 @@ class ScalePhaseAdvanceDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.live_timer.start(200)
+        self._load_curves()  # re-fetch from MCU every time dialog opens
+        self.live_timer.start(50)
 
     def hideEvent(self, event):
         self.live_timer.stop()
         super().hideEvent(event)
 
     def _load_curves(self):
-        self.tmc_ui.get_value_async("tmc", "scaleCurve", self._scale_curve_cb, self.axis, str)
-        self.tmc_ui.get_value_async("tmc", "phaseAdvCurve", self._phase_curve_cb, self.axis, str)
+        # Register callbacks with typechar='?' to match firmware reply format.
+        # Firmware replies: "[tmc.0.scaleCurve?|3:1000,5:1050,...]"
+        self.tmc_ui.register_callback("tmc", "scaleCurve", self._scale_curve_cb, self.axis, str, typechar='?', delete=True)
+        self.tmc_ui.register_callback("tmc", "phaseAdvCurve", self._phase_curve_cb, self.axis, str, typechar='?', delete=True)
+        self.tmc_ui.send_command("tmc", "scaleCurve", self.axis, '?')
+        self.tmc_ui.send_command("tmc", "phaseAdvCurve", self.axis, '?')
+        # Request the harmonic table so the 3rd-harmonic preview can render.
+        # The reply is cached on the main UI (updateCoggingHarmonics); we redraw shortly after.
+        self.tmc_ui.send_command("tmc", "coggingHarmonics", self.axis, '?')
+        QTimer.singleShot(300, self.h3_tab.redraw)
 
     def _parse_curve(self, data, scale):
         """Parse 'rpm:int,rpm:int,...' into a list of floats ordered by CurveEditorTab.RPM_POINTS."""
@@ -1563,22 +1923,16 @@ class ScalePhaseAdvanceDialog(QDialog):
         return result
 
     def _scale_curve_cb(self, data):
-        self.scale_tab.set_values(self._parse_curve(data, 1000.0))
+        vals = self._parse_curve(data, 1000.0)
+        self.scale_tab.set_values(vals)
 
     def _phase_curve_cb(self, data):
-        self.phase_tab.set_values(self._parse_curve(data, 100.0))
+        vals = self._parse_curve(data, 100.0)
+        self.phase_tab.set_values(vals)
 
     def _poll_live(self):
-        # Fetch the current RPM via the acttrq reply (index 5 = measured_rpm)
-        self.tmc_ui.get_value_async("tmc", "acttrq", self._acttrq_cb, self.axis, str)
-
-    def _acttrq_cb(self, data):
-        try:
-            parts = str(data).split(":")
-            if len(parts) >= 6:
-                self.current_rpm = abs(float(parts[5]))
-        except Exception:
-            return
+        """Read cached RPM from the main tab (updated every 50ms by its own timer)."""
+        self.current_rpm = abs(getattr(self.tmc_ui, 'vel_rpm', 0.0))
         self.scale_tab.set_live_rpm(self.current_rpm)
         self.phase_tab.set_live_rpm(self.current_rpm)
 
