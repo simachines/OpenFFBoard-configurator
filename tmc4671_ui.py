@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QMessageBox,QVBoxLayout,QGroupBox,QComboBox,QLabel,QApplication,QDialog,QTextEdit,QPushButton
-from PyQt6.QtWidgets import QSlider, QDoubleSpinBox, QFormLayout, QHBoxLayout, QWidget, QGridLayout, QSpinBox, QScrollArea, QTabWidget
+from PyQt6.QtWidgets import QSlider, QDoubleSpinBox, QFormLayout, QHBoxLayout, QWidget, QGridLayout, QSpinBox, QScrollArea, QTabWidget, QSizePolicy, QCheckBox
 from helper import res_path,classlistToIds,updateListComboBox,qtBlockAndCall
 from PyQt6.QtCore import QTime, QTimer
 from PyQt6.QtCore import Qt,QMargins
@@ -44,7 +44,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.cogging_calibrating = False
         self.cogging_dialog = None
         self.cogging_text = ""
-        self.cogging_harmonics_data = []  # [(order, amplitude, phase), ...]
+        self.cogging_harmonics_data_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}  # profile index -> [(order, amplitude, phase), ...]
+        self.cogging_harmonics_data = []  # [(order, amplitude, phase), ...] — current profile (for backwards compat)
         self.cogging_position = 0.0  # normalized 0-1
         self.cogging_measured_torque = 0  # initialized before first acttrq update
         self.cogging_scale = 1.0  # default until MCU reports actual value
@@ -64,21 +65,69 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 
         self.timer = QTimer(self)
         self.timer_status = QTimer(self)
+        # Fast position update timer for cogging tab profile chart
+        self.timer_pos = QTimer(self)
+        self.timer_pos.timeout.connect(self._update_tab_profile_pos)
+        self.timer_pos.setInterval(20)
     
         self.pushButton_align.clicked.connect(self.alignEnc)
         self.pushButton_autotunepid.clicked.connect(self.autotunePid)
         self.pushButton_cogging.clicked.connect(self.coggingDetection)
-        self.pushButton_resetCoggingTable.clicked.connect(self.resetCoggingTable)
+        # Hide the cogging button on the TMC4671 tab — now in Cogging Calibration dialog
+        self.pushButton_cogging.setVisible(False)
+        # Hide reset/reload table buttons (now in dialog)
         self.pushButton_resetCoggingTable.setVisible(False)
-        self.pushButton_reloadCoggingTable.clicked.connect(self.reloadCoggingTable)
         self.pushButton_reloadCoggingTable.setVisible(False)
         self.tabWidget.currentChanged.connect(self.tabChanged)
         # Hide magnitude slider/spinbox (wired through .ui file)
         self.horizontalSlider_coggmag.hide()
         self.doubleSpinBox_coggScale.hide()
+        # Re-enable cogging tab (tab_6) — shows torque/angle profile chart
+        self.tabWidget.setTabEnabled(1, True)
+        # Hide the old bar chart widget (chart_cogging was removed)
+        self.graphWidget_Cogging.hide()
+        # Remove the graphWidget_Cogging title label if present
+        if hasattr(self, 'label_coggingTitle'):
+            self.label_coggingTitle.hide()
+
+        # ---- Cogging tab: Graph visibility checkboxes ----
+        vis_layout = QHBoxLayout()
+        self.chk_show_combined = QCheckBox("Combined")
+        self.chk_show_combined.setChecked(True)
+        self.chk_show_combined.toggled.connect(self._on_cogtab_vis_changed)
+        vis_layout.addWidget(self.chk_show_combined)
+        self.chk_show_cw = QCheckBox("CW Raw")
+        self.chk_show_cw.setChecked(True)
+        self.chk_show_cw.toggled.connect(self._on_cogtab_vis_changed)
+        vis_layout.addWidget(self.chk_show_cw)
+        self.chk_show_ccw = QCheckBox("CCW Raw")
+        self.chk_show_ccw.setChecked(True)
+        self.chk_show_ccw.toggled.connect(self._on_cogtab_vis_changed)
+        vis_layout.addWidget(self.chk_show_ccw)
+        self.chk_show_cogging = QCheckBox("Cogging Torque")
+        self.chk_show_cogging.setChecked(True)
+        self.chk_show_cogging.toggled.connect(self._on_cogtab_vis_changed)
+        vis_layout.addWidget(self.chk_show_cogging)
+        self.chk_show_pos = QCheckBox("Position")
+        self.chk_show_pos.setChecked(True)
+        self.chk_show_pos.toggled.connect(self._on_cogtab_vis_changed)
+        vis_layout.addWidget(self.chk_show_pos)
+        # Insert visibility row into the cogging tab layout
+        tab = self.tabWidget.widget(1)
+        if tab and tab.layout():
+            vis_widget = QWidget()
+            vis_widget.setLayout(vis_layout)
+            # Insert as a row at the bottom of the cogging tab's layout
+            parent_layout = tab.layout()
+            if isinstance(parent_layout, QGridLayout):
+                # Find the last used row and add after it
+                last_row = parent_layout.rowCount()
+                parent_layout.addWidget(vis_widget, last_row, 0, 1, -1)
+            else:
+                parent_layout.addWidget(vis_widget)
         #self.initUi()
 
-        self.pushButton_scaleTune = QPushButton("Manual Tuning")
+        self.pushButton_scaleTune = QPushButton("Cogging Calibration")
         self.pushButton_scaleTune.clicked.connect(self.openScaleCurveDialog)
         if hasattr(self, 'groupBox_anticogging'):
             formLayout = self.groupBox_anticogging.layout()
@@ -92,20 +141,17 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.main.tabWidget_main.currentChanged.connect(self._on_main_tab_changed)
 
    
-        # Chart setup
+        # Chart setup (amps/temps chart)
         self.chart = QChart()
         self.chart.setBackgroundRoundness(5)
         self.chart.setMargins(QMargins(0,0,0,0))
         self.chartXaxis = QValueAxis(self.chart)
-        # use Application.instance().palette().dark().color() but with 50% opacity
         self.chartXaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),128))
         
-
         self.chart.addAxis(self.chartXaxis,Qt.AlignmentFlag.AlignBottom)
 
         self.chartYaxis_Amps = QValueAxis(self.chart)
         self.chartYaxis_Temps = QValueAxis(self.chart)
-        # use Application.instance().palette().dark().color() but with 25% opacity
         self.chartYaxis_Amps.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
         self.chartYaxis_Temps.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
         self.chart.setBackgroundBrush(QApplication.instance().palette().window())
@@ -115,7 +161,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.lines_Amps = QLineSeries(self.chart)
         self.lines_Amps.setName("Torque A")
         self.lines_Amps.setUseOpenGL(True)
-
         self.chart.addSeries(self.lines_Amps)
         self.lines_Amps.setColor(QColor("cornflowerblue"))
         self.lines_Amps.attachAxis(self.chartYaxis_Amps)
@@ -125,10 +170,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.lines_Flux.setName("Flux A")
         self.lines_Flux.setOpacity(0.5)
         self.lines_Flux.setUseOpenGL(True)
-        
         self.chart.addSeries(self.lines_Flux)
         self.lines_Flux.setColor(QColor("limegreen"))
-
         self.lines_Flux.attachAxis(self.chartYaxis_Amps)
         self.lines_Flux.attachAxis(self.chartXaxis)
         
@@ -155,54 +198,23 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.chartXaxis.setMax(10)
         self.chartYaxis_Amps.setMax(20)
         self.graphWidget_Amps.setRubberBand(QChartView.RubberBand.VerticalRubberBand)
-        self.graphWidget_Amps.setChart(self.chart) # Set the chart widget
+        self.graphWidget_Amps.setChart(self.chart)
 
-        # Set graph theme colors
         self.chart.legend().setVisible(False)
 
-        # Cogging Chart setup
-        self.chart_cogging = QChart()
-        self.chart_cogging.setBackgroundRoundness(5)
-        self.chart_cogging.setMargins(QMargins(0,0,0,0))
-        self.chart_cogging_Xaxis = QValueAxis(self.chart_cogging)
-        self.chart_cogging_Xaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),128))
-        self.chart_cogging.addAxis(self.chart_cogging_Xaxis,Qt.AlignmentFlag.AlignBottom)
-
-        self.chart_cogging_Yaxis = QValueAxis(self.chart_cogging)
-        self.chart_cogging_Yaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
-        self.chart_cogging.setBackgroundBrush(QApplication.instance().palette().window())
-        
-        self.chart_cogging.addAxis(self.chart_cogging_Yaxis,Qt.AlignmentFlag.AlignLeft)
-        
-        self.bar_set_cogging = QBarSet("Harmonics")
-        self.bar_series_cogging = QBarSeries()
-        self.bar_series_cogging.append(self.bar_set_cogging)
-
-        self.chart_cogging.addSeries(self.bar_series_cogging)
-        self.bar_set_cogging.setColor(QColor("cornflowerblue"))
-        self.bar_series_cogging.attachAxis(self.chart_cogging_Yaxis)
-        self.bar_series_cogging.attachAxis(self.chart_cogging_Xaxis)
-
-        self.chart_cogging_Xaxis.setRange(1, 128)
-        self.chart_cogging_Yaxis.setMin(0)
-        self.chart_cogging_Yaxis.setMax(10)
-        self.graphWidget_Cogging.setRubberBand(QChartView.RubberBand.VerticalRubberBand)
-        self.graphWidget_Cogging.setChart(self.chart_cogging)
-
-        self.chart_cogging.legend().setVisible(False)
-
-        # --- Anti-Cogging Profile Chart (position vs torque) ---
+        # --- Torque/Angle Profile Chart in Cogging tab (tab_6) ---
         self.chart_cogging_profile = QChart()
         self.chart_cogging_profile.setBackgroundRoundness(5)
         self.chart_cogging_profile.setMargins(QMargins(0,0,0,0))
-        #self.chart_cogging_profile.setTitle("Anti-Cogging Profile")
 
         self.chart_cp_Xaxis = QValueAxis(self.chart_cogging_profile)
         self.chart_cp_Xaxis.setRange(0, 360)
+        self.chart_cp_Xaxis.setTitleText("Angle (deg)")
         self.chart_cp_Xaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),128))
         self.chart_cogging_profile.addAxis(self.chart_cp_Xaxis, Qt.AlignmentFlag.AlignBottom)
 
         self.chart_cp_Yaxis = QValueAxis(self.chart_cogging_profile)
+        self.chart_cp_Yaxis.setTitleText("Torque")
         self.chart_cp_Yaxis.setGridLineColor(QColor(QApplication.instance().palette().dark().color().red(),QApplication.instance().palette().dark().color().green(),QApplication.instance().palette().dark().color().blue(),64))
         self.chart_cogging_profile.setBackgroundBrush(QApplication.instance().palette().window())
         self.chart_cogging_profile.addAxis(self.chart_cp_Yaxis, Qt.AlignmentFlag.AlignLeft)
@@ -236,7 +248,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.line_cp_ccw.attachAxis(self.chart_cp_Xaxis)
         self.line_cp_ccw.attachAxis(self.chart_cp_Yaxis)
 
-        # Measured Cogging Torque (orange dashed — motor's natural detent force)
+        # Measured Cogging Torque (orange dashed)
         self.line_cp_cogging = QLineSeries(self.chart_cogging_profile)
         self.line_cp_cogging.setName("Cogging Torque")
         self.line_cp_cogging.setColor(QColor("darkorange"))
@@ -248,24 +260,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.chart_cogging_profile.addSeries(self.line_cp_cogging)
         self.line_cp_cogging.attachAxis(self.chart_cp_Xaxis)
         self.line_cp_cogging.attachAxis(self.chart_cp_Yaxis)
-
-        # --- Preview lines (grey dashed, show what Apply will produce) ---
-        def _mk_preview(name, alpha=0.4):
-            s = QLineSeries()
-            s.setName(name)
-            s.setColor(QColor("grey"))
-            pen = s.pen()
-            pen.setStyle(Qt.PenStyle.DashLine)
-            pen.setWidth(1)
-            s.setPen(pen)
-            s.setOpacity(alpha)
-            self.chart_cogging_profile.addSeries(s)
-            s.attachAxis(self.chart_cp_Xaxis)
-            s.attachAxis(self.chart_cp_Yaxis)
-            return s
-
-        self.line_cp_waveform_pv = _mk_preview("Anti-cog (scaled)")
-        self.line_cp_cogging_pv  = _mk_preview("Cogging (scaled)")
 
         # Position dot
         self.scatter_cp_pos = QScatterSeries(self.chart_cogging_profile)
@@ -287,7 +281,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.line_cp_vmarker.attachAxis(self.chart_cp_Xaxis)
         self.line_cp_vmarker.attachAxis(self.chart_cp_Yaxis)
 
-        self.chart_cogging_profile.legend().setVisible(False)
+        self.chart_cogging_profile.legend().setVisible(True)
+        self.chart_cogging_profile.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
 
         self.graphWidget_Profile.setRubberBand(QChartView.RubberBand.RectangleRubberBand)
         self.graphWidget_Profile.setChart(self.chart_cogging_profile)
@@ -374,6 +369,17 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         
         self.checkBox_combineEncoders.stateChanged.connect(self.extEncoderChanged)
 
+        # Track the open scale dialog (non-modal)
+        self._scale_dlg = None
+
+    def _on_cogtab_vis_changed(self):
+        """Toggle series visibility on the TMC cogging tab chart."""
+        self.line_cp_waveform.setVisible(self.chk_show_combined.isChecked())
+        self.line_cp_cw.setVisible(self.chk_show_cw.isChecked())
+        self.line_cp_ccw.setVisible(self.chk_show_ccw.isChecked())
+        self.line_cp_cogging.setVisible(self.chk_show_cogging.isChecked())
+        self.scatter_cp_pos.setVisible(self.chk_show_pos.isChecked())
+        self.line_cp_vmarker.setVisible(self.chk_show_pos.isChecked())
 
     def torqueFilterChanged(self,v):
         self.spinBox_torqueFilterFreq.setEnabled(v > 0)
@@ -391,9 +397,11 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             if self.isEnabled() and not self.cogging_calibrating:
                 self.timer.start(50)
                 self.timer_status.start(250)
+                self.timer_pos.start()
         else:
             self.timer.stop()
             self.timer_status.stop()
+            self.timer_pos.stop()
 
     def coggingSupportedCb(self, info):
         self.cogging_supported = (info != -1)
@@ -417,19 +425,14 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         
         # Cogging visibility depends on motor support AND firmware command existence
         cogging_enabled = supported_motor and self.cogging_supported
-        self.pushButton_cogging.setEnabled(cogging_enabled)
         self.checkBox_cogging.setEnabled(cogging_enabled)
         self.groupBox_anticogging.setEnabled(cogging_enabled)
         self.tabWidget.setTabEnabled(1, cogging_enabled)
         self.syncHarmonicEditor()
 
-
-        # If anti-cogging was enabled, notify user and disable it before graying out
         self.checkBox_cogging.setChecked(self.anti_coggingEnable)
         if self.anti_coggingEnable:
             if not supported_motor:
-                #msg = QMessageBox(QMessageBox.Icon.Information,self.tr("Anti-Cogging"),self.tr("Auto-disabling Anti-Cogging on this motor"))
-                #msg.exec()
                 self.checkBox_cogging.setChecked(False)
 
         if(data == 3):
@@ -455,7 +458,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
     def encselChanged(self,val):
         data = self.comboBox_enc.currentData()
         self.checkBox_abnIndex.setVisible(data == 1) # abnIndex selectable if ABN encoder selected
-
         self.checkBox_abnpol.setVisible(data == 1)
         
         if(data == 5):
@@ -465,13 +467,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         if(data == 2 or data == 3):
             self.label_encoder_notice.setText(aenc_notice)
 
-
-        self.label_encoder_notice.setVisible(data == 5 or data == 4 or data == 3 or data == 2) # Visible for ext, hall and aenc
-        #self.checkBox_abnpol.setEnabled(data == 1)
-
+        self.label_encoder_notice.setVisible(data == 5 or data == 4 or data == 3 or data == 2)
         self.spinBox_cpr.setVisible(data == 1 or data == 2 or data == 3)
         self.label_cpr.setVisible(data == 1 or data == 2 or data == 3)
-
         self.checkBox_combineEncoders.setVisible(data == 1 or data == 2 or data == 3 or data == 4)
         self.checkBox_invertForce.setVisible(data == 1 or data == 2 or data == 3 or data == 4)
         self.checkBox_invertForce.setEnabled(self.checkBox_combineEncoders.isChecked())
@@ -494,7 +492,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         if len(tflist) >= 5:
             pos = tflist[4] / 10000.0  # normalized 0-1
             self.cogging_position = pos
-            self.updateProfilePosition()
         vel_rpm = 0
         if len(tflist) >= 6:
             vel_rpm = int(tflist[5])  # velocity RPM from MCU
@@ -560,14 +557,19 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         except Exception as e:
             self.main.log("TMC update error: " + str(e))
 
+    def _update_tab_profile_pos(self):
+        """Fast 20ms position dot update for cogging tab profile chart (tab_6)."""
+        if not self.tabWidget.isTabEnabled(1):
+            return
+        if self.tabWidget.currentIndex() != 1:
+            return
+        self.updateProfilePosition()
+
     def updateCogging(self,data):
         try:
             if "data" in data:
-                # Correctly parse the "item:X,data:(Y,Z,...)" format
                 item_str, data_str = data.split(',', 1)
                 start_index = int(item_str.split(':')[1])
-                
-                # Extract the numbers from within the parentheses
                 values_str = data_str.split('(')[1].split(')')[0]
                 points = [float(p) for p in values_str.split(',') if p]
 
@@ -575,19 +577,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                     if start_index + i < len(self.cogging_data):
                         self.cogging_data[start_index + i] = p
                         self.cogging_data_received[start_index + i] = True
-                
-                # Redraw the entire graph with the updated data
-                self.bar_set_cogging.remove(0, self.bar_set_cogging.count())
-                # Add a dummy zero at index 0 so that harmonics 1-128 align with X axis values 1-128
-                self.bar_set_cogging.append(0.0)
-                self.bar_set_cogging.append(self.cogging_data)
-
-                self.chart_cogging_Xaxis.setRange(1, 128)
-                
-                valid_data = [p for i, p in enumerate(self.cogging_data) if self.cogging_data_received[i]]
-                if valid_data:
-                    self.chart_cogging_Yaxis.setMax(max(10, max(valid_data)))
-                    self.chart_cogging_Yaxis.setMin(0)
 
         except Exception as e:
             self.main.log("TMC cogging update error: " + str(e))
@@ -597,15 +586,12 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         if(t > 150 or t < -20):
             return
         self.label_Temp.setText(str(round(t,2)) + "°C")
-
-        # Amps updates faster and gives the current timestamp
         self.lines_Temps.append(self.chartLastX+1,t)
         if(self.lines_Temps.count() > self.max_datapoints):
             self.lines_Temps.remove(0)
-
         
         if(t > self.chartYaxis_Temps.max()):
-            self.chartYaxis_Temps.setMax(round(t)) # increase range
+            self.chartYaxis_Temps.setMax(round(t))
     
     def updateVolt(self):
         t = "Mot: {:2.2f}V".format(self.vint)
@@ -638,38 +624,28 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
     def submitMotor(self):
         mtype = self.comboBox_mtype.currentData()
         self.send_value("tmc","mtype",val=mtype,instance=self.axis)
-
         poles = self.spinBox_poles.value()
         self.send_value("tmc","poles",val=poles,instance=self.axis)
-
         self.send_value("tmc","cpr",val=self.spinBox_cpr.value(),instance=self.axis)
-
         enc = self.comboBox_enc.currentData()
         self.send_value("tmc","encsrc",val=enc,instance=self.axis)
-
         self.send_value("tmc","abnindex",val = 1 if self.checkBox_abnIndex.isChecked() else 0,instance=self.axis)
         self.send_value("tmc","abnpol",val = 1 if self.checkBox_abnpol.isChecked() else 0,instance=self.axis)
-
         self.send_value("tmc","combineEncoder",val = 1 if self.checkBox_combineEncoders.isChecked() else 0,instance=self.axis)
         self.send_value("tmc","invertForce",val = 1 if self.checkBox_invertForce.isChecked() else 0,instance=self.axis)
         self.send_value("tmc","cogging",val = 1 if self.checkBox_cogging.isChecked() else 0,instance=self.axis)
+
     def submitPid(self):
-        # PIDs
         seq = 1 if self.checkBox_advancedpid.isChecked() else 0
         self.send_value("tmc","seqpi",val=seq,instance=self.axis)
-
         tp = self.spinBox_tp.value()
         self.send_value("tmc","torqueP",val=tp,instance=self.axis)
-
         ti = self.spinBox_ti.value()
         self.send_value("tmc","torqueI",val=ti,instance=self.axis)
-
         fp = self.spinBox_fp.value()
         self.send_value("tmc","fluxP",val=fp,instance=self.axis)
-
         fi = self.spinBox_fi.value()
         self.send_value("tmc","fluxI",val=fi,instance=self.axis)
-
         prec = self.checkBox_I_Precision.isChecked() | (self.checkBox_P_Precision.isChecked() << 1)
         self.send_value("tmc","pidPrec",val=prec,instance=self.axis)
         self.send_value("tmc","svpwm",val=1 if self.checkBox_svpwm.isChecked() else 0,instance=self.axis)
@@ -684,7 +660,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             if(self.lastPrecP != checked):
                 self.spinBox_tp.setValue(int(self.spinBox_tp.value() * rescale))
                 self.spinBox_fp.setValue(int(self.spinBox_fp.value() * rescale))
-
         self.lastPrecP = self.checkBox_P_Precision.isChecked()
         self.lastPrecI = self.checkBox_I_Precision.isChecked()
 
@@ -717,15 +692,12 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         
         self.label_hwversion.setText(self.hwversions[self.hwversion])
         if self.hwversion == 0 and self.versionWarningShow and len(self.hwversions) > 0:
-            # no version set. ask user to select version
             self.versionWarningShow = False
-            QTimer.singleShot(100,self.showVersionSelectorPopup) # return this function but show popup with a tiny delay
-             
+            QTimer.singleShot(100,self.showVersionSelectorPopup)
         else:
             self.versionWarningShow = False
 
     def init_ui(self):
-        # clear graph
         self.startTime = QTime.currentTime()
         self.chartLastX = 0
         self.lines_Amps.clear()
@@ -737,12 +709,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.chartYaxis_Temps.setMin(0)
         self.chartYaxis_Temps.setMax(90)
         try:
-            # Fill encoder source types
             self.send_commands("tmc",["mtype","encsrc","tmcHwType","trqbq_mode"],self.axis,'!')
             self.send_commands("tmc",["tmctype","tmcHwType","iScale","calibrated","trqbq_f","coggingScale","coggingShape"],self.axis)
             self.send_command("tmc","cogging",self.axis,'?')
-
-            # Check if cogging is supported
             self.get_value_async("tmc", "cmdinfo", self.coggingSupportedCb, self.axis, conversion=int, adr=44)
             self.getMotor()
             self.getPids()
@@ -754,11 +723,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 self.spinBox_torqueFilterFreq.valueChanged.connect(lambda x : self.send_value("tmc","trqbq_f",x,instance=self.axis))
                 self.init_done = True
 
-            # Check if calibrated
-            if self.tabWidget.currentWidget() == self.tab_6:
+            if self.tabWidget.currentWidget() == self.tabWidget.widget(1):
                 self.reloadCoggingTable()
             else:
-                # Pre-fetch cogging data even when on a different sub-tab
                 self.send_command("tmc", "coggingHarmonics", self.axis, '?')
             self.ui_initialized = True
         except Exception as e:
@@ -773,6 +740,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.setEnabled(False)
             self.timer.stop()
             self.timer_status.stop()
+            self.timer_pos.stop()
             self.ui_initialized = False
         else:
             self.groupBox_tmc.setTitle(type)
@@ -781,7 +749,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
     def calibrated(self,v):
         v = int(v)
         if not v and self.isEnabled() and self.comboBox_mtype.currentIndex() != 0 and self.comboBox_enc.currentIndex() != 0:
-            # Warning displayed
             def cb(ret):
                 if ret == QMessageBox.StandardButton.Ok:
                     self.send_command("tmc","calibrate",self.axis)
@@ -807,7 +774,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 msg = QMessageBox(QMessageBox.Icon.Information,"PID autotuning",res)
                 msg.exec()
             self.getPids()
-
         self.get_value_async("tmc","pidautotune",f,self.axis,typechar='?')
         self.main.log("Started PID tuning")
 
@@ -818,7 +784,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             if(res):
                 msg = QMessageBox(QMessageBox.Icon.Information,"Encoder align",res)
                 msg.exec()
-
         self.get_value_async("tmc","encalign",f,self.axis,typechar='?')
         self.main.log("Started encoder alignment")
         
@@ -826,40 +791,36 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         if data:
             msg_text = str(data)
             status = 0
-            # Parsing du nouveau format: ("message de log",0)
             if msg_text.startswith('("') and msg_text.endswith(')'):
                 parts = msg_text.rsplit('",', 1)
                 if len(parts) == 2:
-                    text_part = parts[0][2:] # Remove '("'
+                    text_part = parts[0][2:]
                     try:
-                        status = int(parts[1][:-1]) # Remove ')'
+                        status = int(parts[1][:-1])
                         msg_text = text_part
                     except ValueError:
                         pass
+
+            # Parse CW/CCW — do NOT show in popup
+            is_cw_ccw = msg_text.startswith("CWD:") or msg_text.startswith("CCWD:")
             
-            # Append new message to the accumulated text
-            if self.cogging_text:
-                self.cogging_text += "\n"
-            self.cogging_text += msg_text
+            if not is_cw_ccw:
+                if self.cogging_text:
+                    self.cogging_text += "\n"
+                self.cogging_text += msg_text
             
             if self.cogging_dialog is None:
-                # Create and show a resizable QDialog with a QTextEdit
                 self.cogging_dialog = QDialog(self)
                 self.cogging_dialog.setWindowTitle(self.tr("Cogging calibration"))
                 self.cogging_dialog.setMinimumSize(500, 400)
-                
                 layout = QVBoxLayout(self.cogging_dialog)
-                
                 self.cogging_text_edit = QTextEdit()
                 self.cogging_text_edit.setReadOnly(True)
                 layout.addWidget(self.cogging_text_edit)
-                
                 close_btn = QPushButton(self.tr("Close"))
                 close_btn.clicked.connect(self.cogging_dialog.close)
                 layout.addWidget(close_btn)
-                
                 self.cogging_dialog.show()
-                # Reset state when closed
                 def on_finish():
                     self.cogging_dialog = None
                     self.cogging_text = ""
@@ -867,32 +828,28 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                     if not self.cogging_calibrating:
                         self.timer.start(50)
                         self.timer_status.start(250)
+                        self.timer_pos.start()
                 self.cogging_dialog.finished.connect(on_finish)
             
-            # Update text and scroll to bottom
             self.cogging_text_edit.setText(self.cogging_text)
             self.cogging_text_edit.verticalScrollBar().setValue(self.cogging_text_edit.verticalScrollBar().maximum())
             
-            # Automatically handle end of calibration
             if status == 1:
                 self.cogging_calibrating = False
-                self.pushButton_cogging.setEnabled(True)
                 self.timer.start(50)
                 self.timer_status.start(250)
+                self.timer_pos.start()
                 self.reloadCoggingTable()
                 self.send_command("tmc", "cogging", self.axis, '?')
-                # Also fetch raw CW/CCW data now that calibration finished
                 self.send_command("tmc", "coggingCwCcw", self.axis, '?')
 
-            # Parse CW/CCW raw harmonic data from calibration log
-            # Messages are broadcast with prefixes CWD: or CCWD:
-            if msg_text.startswith("CWD:") or msg_text.startswith("CCWD:"):
+            # Parse CW/CCW silently
+            if is_cw_ccw:
                 try:
                     is_cw = msg_text.startswith("CWD:")
                     prefix = "CWD:" if is_cw else "CCWD:"
                     data_str = msg_text[len(prefix):]
                     target_list = self.cw_raw_harmonics if is_cw else self.ccw_raw_harmonics
-
                     for chunk in data_str.split(","):
                         chunk = chunk.strip()
                         if not chunk:
@@ -901,9 +858,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                         if len(parts) == 3:
                             order = int(parts[0])
                             mag = float(parts[1])
-                            phase = float(parts[2]) / 1000.0  # rad*1000 from firmware
+                            phase = float(parts[2]) / 1000.0
                             if mag > 0.0:
-                                # Update existing or append
                                 found = False
                                 for i, (o, m, p) in enumerate(target_list):
                                     if o == order:
@@ -914,40 +870,34 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                                     target_list.append((order, mag, phase))
                     self.rebuildCwCcwWaveforms()
                 except Exception:
-                    pass  # silently ignore parse errors in calibration log
+                    pass
         
     def coggingDetection(self):
-        self.pushButton_cogging.setEnabled(False)
         self.cogging_calibrating = True
         self.timer.stop()
         self.timer_status.stop()
+        self.timer_pos.stop()
         self.send_command("tmc","calibrateCogging", self.axis)
         self.main.log("Started cogging detection")
 
     def tabChanged(self, index):
-        # Automatically reload the cogging table when its tab is selected
-        if self.tabWidget.widget(index) == self.tab_6:
+        if self.tabWidget.widget(index) == self.tabWidget.widget(1):
             self.reloadCoggingTable()
 
     def clearCoggingGraph(self):
-        self.bar_set_cogging.remove(0, self.bar_set_cogging.count())
         self.cogging_data = [0] * 128
         self.cogging_data_received = [False] * 128
-        # Reset axes to default values
-        self.chart_cogging_Yaxis.setMin(0)
-        self.chart_cogging_Yaxis.setMax(10)
         self.clearCoggingProfile()
 
     def clearCoggingProfile(self):
         self.cogging_harmonics_data = []
+        self.cogging_harmonics_data_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}
         self.cw_raw_harmonics = []
         self.ccw_raw_harmonics = []
         self.line_cp_waveform.clear()
         self.line_cp_cw.clear()
         self.line_cp_ccw.clear()
         self.line_cp_cogging.clear()
-        self.line_cp_waveform_pv.clear()
-        self.line_cp_cogging_pv.clear()
         self.scatter_cp_pos.clear()
         self.line_cp_vmarker.clear()
         self.chart_cp_Yaxis.setMin(-10)
@@ -959,35 +909,14 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 
     def updateHarmonicPreview(self):
         if not self.cogging_harmonics_data:
-            self.bar_set_cogging.remove(0, self.bar_set_cogging.count())
             self.line_cp_waveform.clear()
             self.line_cp_cogging.clear()
             self.scatter_cp_pos.clear()
             self.line_cp_vmarker.clear()
             return
-
-        self.bar_set_cogging.remove(0, self.bar_set_cogging.count())
-        self.bar_set_cogging.append(0.0)
-
-        bars = [0.0] * 128
-        for order, amp, _phase in self.cogging_harmonics_data:
-            if 1 <= int(order) <= 128:
-                bars[int(order) - 1] = float(amp)
-
-        self.bar_set_cogging.append(bars)
-        self.chart_cogging_Xaxis.setRange(1, 128)
-
-        valid_data = [amp for _order, amp, _phase in self.cogging_harmonics_data if amp > 0]
-        if valid_data:
-            self.chart_cogging_Yaxis.setMax(max(10, max(valid_data)))
-            self.chart_cogging_Yaxis.setMin(0)
-
         self.rebuildProfileWaveform()
 
-
-
     def updateCoggingHarmonics(self, data):
-        """Parse coggingHarmonics reply: 'order:amp:phase,...' and rebuild waveform."""
         try:
             if not data or data == "0:0:0":
                 self.cogging_harmonics_data = []
@@ -1001,7 +930,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 if len(parts) == 3:
                     order = int(parts[0])
                     amp = float(parts[1])
-                    phase = float(parts[2]) / 1000.0  # phase * 1000 from firmware
+                    phase = float(parts[2]) / 1000.0
                     if order > 0 or amp > 0:
                         harmonics.append((order, amp, phase))
             
@@ -1012,7 +941,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.main.log("TMC cogging harmonics parse error: " + str(e))
 
     def updateCwCcwData(self, data):
-        """Parse coggingCwCcw reply: 'CW:order:amp:phase,...|CCW:order:amp:phase,...'"""
         try:
             if not data:
                 return
@@ -1050,39 +978,21 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.main.log("TMC CW/CCW parse error: " + str(e))
 
     def rebuildProfileWaveform(self):
-        """Draw green (anti-cogging sin), orange (cogging potential cos)."""
         self.line_cp_waveform.clear()
         self.line_cp_cogging.clear()
-        self.line_cp_waveform_pv.clear()
-        self.line_cp_cogging_pv.clear()
         if not self.cogging_harmonics_data:
             return
-
-        s = self.pot_scale
-        show_pv = abs(s - 1.0) > 0.005
 
         max_amp = 0.0
         for deg in range(0, 361):
             theta = math.radians(deg)
             green = 0.0
             orange = 0.0
-            green_pv = 0.0
-            orange_pv = 0.0
             for order, amp, phase in self.cogging_harmonics_data:
-                # Main lines: firmware amplitude (no pot_scale)
                 green  += amp * math.sin(order * theta + phase)
                 orange -= amp * math.cos(order * theta + phase)
-                # Scaled previews
-                if show_pv:
-                    a_s = amp * s
-                    green_pv  += a_s * math.sin(order * theta + phase)
-                    orange_pv -= a_s * math.cos(order * theta + phase)
             self.line_cp_waveform.append(float(deg), float(green))
             self.line_cp_cogging.append(float(deg), float(orange))
-            if show_pv:
-                self.line_cp_waveform_pv.append(float(deg), float(green_pv))
-                self.line_cp_cogging_pv.append(float(deg), float(orange_pv))
-                max_amp = max(max_amp, abs(green_pv), abs(orange_pv))
             max_amp = max(max_amp, abs(green), abs(orange))
 
         margin = max(max_amp * 1.2, 10.0)
@@ -1093,18 +1003,14 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         pass
 
     def on_pot_scale_changed(self, _val=None):
-        self.pot_scale = 1.0  # visualization-only, always 1.0 now
+        self.pot_scale = 1.0
         self.rebuildProfileWaveform()
 
     def rebuildCwCcwWaveforms(self):
-        """Rebuild CW (red) and CCW (blue) raw waveforms only.
-        Orange and green are drawn by rebuildProfileWaveform from firmware data."""
         self.line_cp_cw.clear()
         self.line_cp_ccw.clear()
-
         if not self.cw_raw_harmonics and not self.ccw_raw_harmonics:
             return
-
         if self.cw_raw_harmonics:
             for deg in range(0, 361):
                 theta = math.radians(deg)
@@ -1112,7 +1018,6 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 for order, amp, phase in self.cw_raw_harmonics:
                     v += amp * math.sin(order * theta + phase)
                 self.line_cp_cw.append(float(deg), float(v))
-
         if self.ccw_raw_harmonics:
             for deg in range(0, 361):
                 theta = math.radians(deg)
@@ -1122,23 +1027,16 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 self.line_cp_ccw.append(float(deg), float(v))
 
 
-
     def applyHarmonicMagnitudes(self):
         pass
 
     def updateProfilePosition(self):
-        """Update the position dot and vertical marker on the profile chart.
-        X = position (from MCU). Y = measured anti-cogging torque (from MCU)."""
         pos_deg = self.cogging_position * 360.0
-        
-        # Use the actual measured anti-cogging torque from MCU, not the computed harmonic value.
         torque = self.cogging_measured_torque
         
-        # Update position dot
         self.scatter_cp_pos.clear()
         self.scatter_cp_pos.append(pos_deg, torque)
         
-        # Update vertical marker line
         y_min = self.chart_cp_Yaxis.min()
         y_max = self.chart_cp_Yaxis.max()
         self.line_cp_vmarker.clear()
@@ -1156,25 +1054,30 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.send_command("tmc", "coggingCwCcw", self.axis, '?')
 
     def coggingScaleCb(self, val):
-        pass  # magnitude slider removed; scale now read-only on TMC tab
+        pass
 
     def openScaleCurveDialog(self):
-        dlg = ScalePhaseAdvanceDialog(self, self.axis)
-        dlg.exec()
+        if hasattr(self, '_scale_dlg') and self._scale_dlg is not None:
+            self._scale_dlg.raise_()
+            self._scale_dlg.activateWindow()
+            return
+        self._scale_dlg = ScalePhaseAdvanceDialog(self, self.axis)
+        self._scale_dlg.finished.connect(self._on_scale_dlg_closed)
+        self._scale_dlg.show()
+
+    def _on_scale_dlg_closed(self, result=0):
+        self._scale_dlg = None
 
     def coggingShapeCb(self, val):
-        pass  # waveshape widget removed; shaping now handled by HarmShapingTab
+        pass
 
     def getMotor(self):
         commands=["mtype","poles","encsrc","cpr","abnindex","abnpol","combineEncoder","invertForce","fluxbrake","calibrated"]
         self.send_commands("tmc",commands,self.axis)
 
-
     def getPids(self):
         commands = ["pidPrec","torqueP","torqueI","fluxP","fluxI","seqpi","svpwm"]
         self.send_commands("tmc",commands,self.axis)
-
-        
 
     def setCurrentScaler(self,x):
         self.send_command("tmc","fluxoffset",self.axis)
@@ -1187,26 +1090,10 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 
 
 class CurveEditorTab(QWidget):
-    """One editable speed-dependent curve: a chart with a live RPM dot plus per-RPM spinboxes.
-
-    Sliders
-    - Left vertical:  first-point value (beginning of graph), maps 0–100 → y_min..y_max
-    - Right vertical: last-point value (end of graph), same mapping
-    - Knee horizontal: RPM breakpoint below which the curve is flattened to a plateau
-      (snaps to actual RPM_POINTS values: 3,5,7,10,12,15…256)
-
-    Shaping pipeline (non-compounding): base → remap between begin/end → knee flatten → clamp.
-    Values are sent to the MCU automatically when a spinbox changes; the curve is
-    fetched from the MCU on open.
-    """
-    # RPM breakpoints shared with firmware (must match scale_curve_rpm_defaults)
+    """One editable speed-dependent curve: a chart with a live RPM dot plus per-RPM spinboxes."""
     RPM_POINTS = [0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256]
 
     def __init__(self, tmc_ui, axis, cmd_name, y_label, y_min, y_max, y_step, scale, decimals):
-        """
-        cmd_name : firmware command ('scaleCurve' or 'phaseAdvCurve')
-        scale    : divisor applied to the integer value from/to the MCU to get the float value
-        """
         super().__init__()
         self.tmc_ui = tmc_ui
         self.axis = axis
@@ -1214,15 +1101,14 @@ class CurveEditorTab(QWidget):
         self.scale = float(scale)
         self._y_min = float(y_min)
         self._y_max = float(y_max)
-        self._loading = False      # suppress handlers while programmatically updating spinboxes
-        self._shaping_sync = False # guard against recursive slider cross-sync
+        self._loading = False
+        self._shaping_sync = False
 
-        # Shaping state — all sliders derive visible spinbox values from these.
         self.base_values = [0.0] * len(self.RPM_POINTS)
-        self.target_begin = 0.0   # desired value at first RPM (from left vertical slider)
-        self.target_end = 0.0     # desired value at last RPM (from right vertical slider)
-        self.knee_idx = 0         # breakpoint INDEX below which curve is flattened (0 = no flattening)
-        self._slider_dragging = False  # true while a slider is being dragged
+        self.target_begin = 0.0
+        self.target_end = 0.0
+        self.knee_idx = 0
+        self._slider_dragging = False
         self._send_debounce = QTimer(self)
         self._send_debounce.setSingleShot(True)
         self._send_debounce.setInterval(250)
@@ -1230,7 +1116,6 @@ class CurveEditorTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ---- Chart ----
         self.chart = QChart()
         self.chart.setMargins(QMargins(2,2,2,2))
         self.chart.legend().hide()
@@ -1249,7 +1134,6 @@ class CurveEditorTab(QWidget):
         self.curve_series.attachAxis(self.axisX)
         self.curve_series.attachAxis(self.axisY)
 
-        # Vertical knee marker (bright yellow so it's clearly visible when dragged)
         self.knee_series = QLineSeries()
         self.knee_series.setColor(QColor(255, 220, 0, 200))
         pen = self.knee_series.pen()
@@ -1271,10 +1155,8 @@ class CurveEditorTab(QWidget):
         self.chartView = QChartView(self.chart)
         self.chartView.setMinimumHeight(220)
 
-        # ---- Chart row: [begin-point slider] [chart] [end-point slider] ----
         chart_row = QHBoxLayout()
 
-        # Left vertical — first RPM point value
         left_col = QVBoxLayout()
         left_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_col.addWidget(QLabel("Begin"), 0, Qt.AlignmentFlag.AlignHCenter)
@@ -1297,7 +1179,6 @@ class CurveEditorTab(QWidget):
 
         chart_row.addWidget(self.chartView, 1)
 
-        # Right vertical — last RPM point value
         right_col = QVBoxLayout()
         right_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_col.addWidget(QLabel("End"), 0, Qt.AlignmentFlag.AlignHCenter)
@@ -1319,7 +1200,6 @@ class CurveEditorTab(QWidget):
         chart_row.addLayout(right_col)
         layout.addLayout(chart_row)
 
-        # ---- Knee RPM slider (horizontal, snaps to actual RPM breakpoints) ----
         knee_row = QHBoxLayout()
         knee_row.addWidget(QLabel("Knee RPM:"))
         self.slider_knee = QSlider(Qt.Orientation.Horizontal)
@@ -1337,11 +1217,9 @@ class CurveEditorTab(QWidget):
         knee_row.addWidget(self.spin_knee)
         layout.addLayout(knee_row)
 
-        # Status line
         self.lbl_status = QLabel("Begin: --   End: --   Knee: 0 RPM")
         layout.addWidget(self.lbl_status)
 
-        # ---- Spinboxes grid in scroll area ----
         spin_container = QWidget()
         grid = QGridLayout(spin_container)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -1366,7 +1244,6 @@ class CurveEditorTab(QWidget):
 
         self.redraw_curve()
 
-    # ---- Slider drag / debounce ----
     def _on_slider_press(self):
         self._slider_dragging = True
         self._send_debounce.stop()
@@ -1377,25 +1254,19 @@ class CurveEditorTab(QWidget):
         self._apply_shaping(send=True)
 
     def _debounced_send(self):
-        """Fire after 250ms quiet — sends if slider is still at rest (no drag)."""
         if not self._slider_dragging:
             self._apply_shaping(send=True)
 
-    # ---- Slider helpers ----
     def _slider_to_value(self, slider_val):
-        """Map 0–100 slider integer → y_min..y_max."""
         return self._y_min + (slider_val / 100.0) * (self._y_max - self._y_min)
 
     def _value_to_slider(self, val):
-        """Map y_min..y_max value → 0–100 slider integer."""
         span = self._y_max - self._y_min
         if span <= 0:
             return 0
         return int(round((val - self._y_min) / span * 100.0))
 
-    # ---- Slider callbacks ----
     def _on_begin_slider(self, val):
-        """Target value for the first RPM point. Whole curve remaps between begin–end."""
         if self._shaping_sync:
             return
         self.target_begin = self._slider_to_value(val)
@@ -1404,7 +1275,6 @@ class CurveEditorTab(QWidget):
             self._send_debounce.start()
 
     def _on_end_slider(self, val):
-        """Target value for the last RPM point. Whole curve remaps between begin–end."""
         if self._shaping_sync:
             return
         self.target_end = self._slider_to_value(val)
@@ -1413,21 +1283,18 @@ class CurveEditorTab(QWidget):
             self._send_debounce.start()
 
     def _on_begin_spin(self, val):
-        """Begin spinbox edited: snap slider and apply."""
         if self._shaping_sync:
             return
         self.target_begin = float(val)
         self._apply_shaping(send=True)
 
     def _on_end_spin(self, val):
-        """End spinbox edited: snap slider and apply."""
         if self._shaping_sync:
             return
         self.target_end = float(val)
         self._apply_shaping(send=True)
 
     def _on_knee_slider(self, val):
-        """Knee slider position == breakpoint index. 0 = no flattening."""
         if self._shaping_sync:
             return
         self.knee_idx = int(val)
@@ -1436,10 +1303,8 @@ class CurveEditorTab(QWidget):
             self._send_debounce.start()
 
     def _on_knee_spin(self, val):
-        """Knee RPM typed: find nearest breakpoint index and snap slider."""
         if self._shaping_sync:
             return
-        # Find the breakpoint index whose RPM is closest to typed value
         rpm_val = int(val)
         best_idx = 0
         best_dist = abs(rpm_val - 0)
@@ -1451,15 +1316,7 @@ class CurveEditorTab(QWidget):
         self.knee_idx = best_idx
         self._apply_shaping(send=True)
 
-    # ---- Shaping pipeline ----
     def _apply_shaping(self, send=False):
-        """Recompute visible spinbox values as a plateau + linear ramp defined by the sliders.
-
-        Model (sliders fully define the shape; base curve shape is not preserved):
-          - Points with index < knee_idx: flat at target_begin
-          - Points with index >= knee_idx: linear ramp from target_begin to target_end
-        Clamp to Y range.  If send=True, push all points to the MCU.
-        """
         if not self.base_values:
             return
 
@@ -1467,20 +1324,18 @@ class CurveEditorTab(QWidget):
         knee_idx = max(0, min(self.knee_idx, N - 1))
         rpm_knee = self.RPM_POINTS[knee_idx]
         rpm_last = self.RPM_POINTS[-1]
-        rpm_span = rpm_last - rpm_knee  # RPM range covered by the ramp region
+        rpm_span = rpm_last - rpm_knee
 
         self._loading = True
         for i, sb in enumerate(self.spinboxes):
             rpm_i = self.RPM_POINTS[i]
             if i < knee_idx:
-                v = self.target_begin                       # plateau below knee
+                v = self.target_begin
             else:
                 if rpm_span <= 0:
-                    # knee at the very last point: only that point takes target_end
                     v = self.target_end if i == N - 1 else self.target_begin
                 else:
-                    # Linear interpolation based on actual RPM, not point index
-                    t = (rpm_i - rpm_knee) / rpm_span       # 0 at knee RPM → 1 at last RPM
+                    t = (rpm_i - rpm_knee) / rpm_span
                     v = self.target_begin + t * (self.target_end - self.target_begin)
             v = max(self._y_min, min(self._y_max, v))
             sb.setValue(v)
@@ -1497,7 +1352,6 @@ class CurveEditorTab(QWidget):
         self._update_status()
 
     def _sync_vertical_sliders(self):
-        """Push target_begin/target_end/knee_idx back to slider positions and spinboxes."""
         self._shaping_sync = True
         self.slider_begin.blockSignals(True)
         self.slider_end.blockSignals(True)
@@ -1534,7 +1388,6 @@ class CurveEditorTab(QWidget):
             f"Begin: {begin_txt}   End: {end_txt}   Knee: {knee_txt} RPM")
 
     def _reset_shaping_sliders(self):
-        """Return all sliders and spinboxes to neutral without firing handlers."""
         self._shaping_sync = True
         for s in (self.slider_begin, self.slider_end, self.slider_knee,
                   self.spin_begin, self.spin_end, self.spin_knee):
@@ -1550,19 +1403,13 @@ class CurveEditorTab(QWidget):
             s.blockSignals(False)
         self._shaping_sync = False
 
-    # ---- Data I/O ----
     def set_values(self, float_values):
-        """Populate spinboxes from a list of float values (len == RPM_POINTS) without sending.
-
-        Snapshots this as the new shaping base and sets targets to match actual endpoints.
-        """
         self._loading = True
         for i, sb in enumerate(self.spinboxes):
             if i < len(float_values):
                 sb.setValue(float(float_values[i]))
         self._loading = False
         self.base_values = [sb.value() for sb in self.spinboxes]
-        # Targets match the loaded curve endpoints (neutral shaping)
         self.target_begin = self.base_values[0] if self.base_values else 0.0
         self.target_end = self.base_values[-1] if self.base_values else 0.0
         self.knee_idx = 0
@@ -1574,14 +1421,12 @@ class CurveEditorTab(QWidget):
     def _on_spin_changed(self, idx, val):
         if self._loading:
             return
-        # A manual spinbox edit is authoritative: re-snapshot base and neutralize shaping.
         self.base_values = [sb.value() for sb in self.spinboxes]
         self.target_begin = self.base_values[0] if self.base_values else 0.0
         self.target_end = self.base_values[-1] if self.base_values else 0.0
         self.knee_idx = 0
         self._reset_shaping_sliders()
         self._update_knee_marker()
-        # Auto-send the edited point to MCU (integer encoded)
         self.tmc_ui.send_value("tmc", self.cmd_name, adr=idx,
                                val=int(round(val * self.scale)), instance=self.axis)
         self.redraw_curve()
@@ -1613,18 +1458,7 @@ class CurveEditorTab(QWidget):
 
 
 class HarmShapingTab(QWidget):
-    """Editor for the cogging waveshaping ("3rd harmonic") parameters.
-
-    Lets the user subtract/add a harmonic of the DOMINANT detected cogging order
-    to reshape the compensation profile (thin peaks / steep slopes) so it matches
-    the physical stator-tooth feel better than the raw Fourier sum.
-
-    Firmware command `coggingH3` (setat): adr 0 = shaping(*1000), 1 = phase trim
-    (mrad), 2 = mult (1..31). get returns "shaping:phaseTrim:mult".
-
-    The chart previews one revolution of the original cogging compensation (from
-    the cached harmonic table) versus the shaped wave, so the effect is visible.
-    """
+    """Editor for cogging waveshaping parameters with harmonics bar chart and RPM profile selector."""
 
     def __init__(self, tmc_ui, axis):
         super().__init__()
@@ -1634,43 +1468,99 @@ class HarmShapingTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ---- Chart ----
-        self.chart = QChart()
-        self.chart.setMargins(QMargins(2, 2, 2, 2))
-        self.chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
-        self.axisX = QValueAxis()
-        self.axisX.setTitleText("Angle (deg)")
-        self.axisX.setRange(0, 360)
-        self.axisY = QValueAxis()
-        self.axisY.setTitleText("Compensation")
-        self.chart.addAxis(self.axisX, Qt.AlignmentFlag.AlignBottom)
-        self.chart.addAxis(self.axisY, Qt.AlignmentFlag.AlignLeft)
+        # RPM profile selector
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Edit RPM profile #:"))
+        self.spin_rpm_profile = QSpinBox()
+        self.spin_rpm_profile.setRange(1, 5)
+        self.spin_rpm_profile.setValue(1)
+        self.spin_rpm_profile.setToolTip("Select which RPM calibration profile's harmonics to edit")
+        self.spin_rpm_profile.valueChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.spin_rpm_profile)
+        profile_row.addStretch(1)
+        layout.addLayout(profile_row)
+
+        # Chart toggle
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(QLabel("Chart view:"))
+        self.combo_chart_view = QComboBox()
+        self.combo_chart_view.addItem("Waveform (angle)")
+        self.combo_chart_view.addItem("Harmonic Magnitudes")
+        self.combo_chart_view.currentIndexChanged.connect(self._on_view_changed)
+        toggle_row.addWidget(self.combo_chart_view)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
+
+        # Stacked charts
+        self.stack = QWidget()
+        self.stack_layout = QVBoxLayout(self.stack)
+        self.stack_layout.setContentsMargins(0,0,0,0)
+
+        # Waveform chart
+        self.chart_wave = QChart()
+        self.chart_wave.setMargins(QMargins(2, 2, 2, 2))
+        self.chart_wave.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        self.axisX_wave = QValueAxis()
+        self.axisX_wave.setTitleText("Angle (deg)")
+        self.axisX_wave.setRange(0, 360)
+        self.axisY_wave = QValueAxis()
+        self.axisY_wave.setTitleText("Compensation")
+        self.chart_wave.addAxis(self.axisX_wave, Qt.AlignmentFlag.AlignBottom)
+        self.chart_wave.addAxis(self.axisY_wave, Qt.AlignmentFlag.AlignLeft)
 
         self.orig_series = QLineSeries()
         self.orig_series.setName("Original")
         self.orig_series.setColor(QColor("#3daee9"))
-        self.chart.addSeries(self.orig_series)
-        self.orig_series.attachAxis(self.axisX)
-        self.orig_series.attachAxis(self.axisY)
+        self.chart_wave.addSeries(self.orig_series)
+        self.orig_series.attachAxis(self.axisX_wave)
+        self.orig_series.attachAxis(self.axisY_wave)
 
         self.shaped_series = QLineSeries()
         self.shaped_series.setName("Shaped")
         self.shaped_series.setColor(QColor("#da4453"))
-        self.chart.addSeries(self.shaped_series)
-        self.shaped_series.attachAxis(self.axisX)
-        self.shaped_series.attachAxis(self.axisY)
+        self.chart_wave.addSeries(self.shaped_series)
+        self.shaped_series.attachAxis(self.axisX_wave)
+        self.shaped_series.attachAxis(self.axisY_wave)
 
-        self.chartView = QChartView(self.chart)
-        self.chartView.setMinimumHeight(240)
-        layout.addWidget(self.chartView, 1)
+        self.view_wave = QChartView(self.chart_wave)
+        self.view_wave.setMinimumHeight(240)
 
-        # ---- Controls ----
+        # Harmonics bar chart
+        self.chart_bars = QChart()
+        self.chart_bars.setMargins(QMargins(2, 2, 2, 2))
+        self.chart_bars.legend().hide()
+        self.axisX_bars = QValueAxis()
+        self.axisX_bars.setTitleText("Harmonic order")
+        self.axisX_bars.setRange(1, 128)
+        self.axisY_bars = QValueAxis()
+        self.axisY_bars.setTitleText("Amplitude")
+        self.axisY_bars.setMin(0)
+        self.axisY_bars.setMax(10)
+        self.chart_bars.addAxis(self.axisX_bars, Qt.AlignmentFlag.AlignBottom)
+        self.chart_bars.addAxis(self.axisY_bars, Qt.AlignmentFlag.AlignLeft)
+
+        self.bar_set = QBarSet("Harmonics")
+        self.bar_series = QBarSeries()
+        self.bar_series.append(self.bar_set)
+        self.chart_bars.addSeries(self.bar_series)
+        self.bar_set.setColor(QColor("cornflowerblue"))
+        self.bar_series.attachAxis(self.axisY_bars)
+        self.bar_series.attachAxis(self.axisX_bars)
+
+        self.view_bars = QChartView(self.chart_bars)
+        self.view_bars.setMinimumHeight(240)
+
+        self.stack_layout.addWidget(self.view_wave)
+        self.stack_layout.addWidget(self.view_bars)
+        self.view_bars.hide()
+        layout.addWidget(self.stack, 1)
+
+        # Controls
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # Shaping factor (slider + spinbox): signed fraction of dominant amplitude.
         self.slider_shaping = QSlider(Qt.Orientation.Horizontal)
-        self.slider_shaping.setRange(-100, 100)  # -1.00 .. +1.00 in steps of 0.01
+        self.slider_shaping.setRange(-100, 100)
         self.slider_shaping.setValue(0)
         self.slider_shaping.valueChanged.connect(self._on_shaping_slider)
         shaping_row = QHBoxLayout()
@@ -1686,16 +1576,12 @@ class HarmShapingTab(QWidget):
         shaping_w.setLayout(shaping_row)
         form.addRow("Shaping (+ = subtract, thin peaks):", shaping_w)
 
-        # Harmonic multiplier of the dominant order (2,3,5...).
         self.spin_mult = QSpinBox()
         self.spin_mult.setRange(1, 31)
         self.spin_mult.setValue(3)
         self.spin_mult.valueChanged.connect(self._on_mult_changed)
         form.addRow("Harmonic multiplier (3 = 3rd):", self.spin_mult)
 
-        # Phase trim in degrees — rotates the applied shaping harmonic around the
-        # electrical angle. This shifts where along the revolution the peak‑shaving
-        # effect lands, letting you align it precisely with the physical detent position.
         self.spin_phase = QDoubleSpinBox()
         self.spin_phase.setRange(-180.0, 180.0)
         self.spin_phase.setSingleStep(1.0)
@@ -1703,19 +1589,88 @@ class HarmShapingTab(QWidget):
         self.spin_phase.setSuffix(" deg")
         self.spin_phase.setValue(0.0)
         self.spin_phase.setToolTip("Rotates the shaped harmonic around the electrical revolution "
-                                   "so the peak‑shaving effect aligns with the physical detents")
+                                   "so the peak-shaving effect aligns with the physical detents")
         self.spin_phase.valueChanged.connect(self._on_phase_changed)
         form.addRow("Phase trim:", self.spin_phase)
 
-        # Read-only info about the detected dominant harmonic.
         self.label_dom = QLabel("Dominant order: —")
         form.addRow("", self.label_dom)
 
         layout.addLayout(form)
 
+        self._current_profile = 1
+        self._profile_data_loaded = False
         self._load_from_mcu()
 
-    # ---------- loading ----------
+    def _on_view_changed(self, idx):
+        if idx == 0:
+            self.view_wave.show()
+            self.view_bars.hide()
+        else:
+            self.view_wave.hide()
+            self.view_bars.show()
+            self._rebuild_bar_chart()
+
+    def _on_profile_changed(self, val):
+        # Request harmonic data for the selected RPM profile from the firmware.
+        # Firmware uses adr 0=profile1, 1=profile2, 2=profile3, etc.
+        # self.spin_rpm_profile values are 1-based.
+        if val >= 1:
+            adr = val - 1  # Convert 1-based profile index to 0-based adr
+            self._current_profile = val
+            self._profile_data_loaded = False
+            self.tmc_ui.get_value_async("tmc", "coggingHarmonics",
+                                        self._on_profile_harmonics_loaded,
+                                        self.axis, str, adr=adr)
+        else:
+            self._current_profile = 1
+        self.redraw()
+        self._rebuild_bar_chart()
+
+    def _on_profile_harmonics_loaded(self, data):
+        """Callback when firmware returns harmonics for a specific RPM profile."""
+        try:
+            harmonics = []
+            if not data or data == "0:0:0":
+                pass  # empty profile
+            else:
+                for item in str(data).split(","):
+                    parts = item.split(":")
+                    if len(parts) == 3:
+                        order = int(parts[0])
+                        amp = float(parts[1])
+                        phase = float(parts[2]) / 1000.0
+                        if order > 0 or amp > 0:
+                            harmonics.append((order, amp, phase))
+
+            # Store per-profile
+            self.tmc_ui.cogging_harmonics_data_profiles[self._current_profile] = harmonics
+            # Swap the active harmonic data to the selected profile
+            self.tmc_ui.cogging_harmonics_data = harmonics
+            self._profile_data_loaded = True
+        except Exception:
+            pass
+        self.redraw()
+        self._rebuild_bar_chart()
+
+    def _rebuild_bar_chart(self):
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        self.bar_set.remove(0, self.bar_set.count())
+        self.bar_set.append(0.0)
+        bars = [0.0] * 128
+        for order, amp, _phase in harms:
+            if 1 <= int(order) <= 128:
+                bars[int(order) - 1] = float(amp)
+        self.bar_set.append(bars)
+        self.axisX_bars.setRange(1, 128)
+        valid_data = [amp for _order, amp, _phase in harms if amp > 0]
+        if valid_data:
+            self.axisY_bars.setMax(max(10, max(valid_data)))
+            self.axisY_bars.setMin(0)
+        else:
+            self.axisY_bars.setMin(0)
+            self.axisY_bars.setMax(10)
+
     def _load_from_mcu(self):
         self.tmc_ui.get_value_async("tmc", "coggingH3", self._h3_cb, self.axis, str)
 
@@ -1737,7 +1692,6 @@ class HarmShapingTab(QWidget):
             self._loading = False
         self.redraw()
 
-    # ---------- handlers ----------
     def _on_shaping_slider(self, val):
         if self._loading:
             return
@@ -1762,7 +1716,6 @@ class HarmShapingTab(QWidget):
     def _on_phase_changed(self, val):
         if self._loading:
             return
-        # degrees -> millirad
         mrad = int(round(val * math.pi / 180.0 * 1000.0))
         self._send(1, mrad)
         self.redraw()
@@ -1770,9 +1723,7 @@ class HarmShapingTab(QWidget):
     def _send(self, adr, val):
         self.tmc_ui.send_value("tmc", "coggingH3", val=val, adr=adr, instance=self.axis)
 
-    # ---------- preview ----------
     def _dominant_harmonic(self):
-        """Return (order, amp, phase_rad) of the largest cached cogging harmonic, or None."""
         harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
         best = None
         for h in harms:
@@ -1798,7 +1749,6 @@ class HarmShapingTab(QWidget):
         mult = self.spin_mult.value()
         phase_trim_rad = self.spin_phase.value() * math.pi / 180.0
 
-        # Reconstruct original and shaped waves over one revolution.
         N = 360
         orig = [0.0] * N
         shaped = [0.0] * N
@@ -1820,7 +1770,6 @@ class HarmShapingTab(QWidget):
             self.shaped_series.clear()
             return
 
-        # Apply shaping term using the dominant harmonic.
         for i in range(N):
             theta = (i / N) * 2.0 * math.pi
             v = orig[i]
@@ -1837,77 +1786,363 @@ class HarmShapingTab(QWidget):
         if y_max - y_min < 1e-6:
             y_max = y_min + 1.0
         pad = (y_max - y_min) * 0.1
-        self.axisY.setRange(y_min - pad, y_max + pad)
+        self.axisY_wave.setRange(y_min - pad, y_max + pad)
         for i in range(N):
-            deg = i  # 0..359
+            deg = i
             self.orig_series.append(deg, orig[i])
             self.shaped_series.append(deg, shaped[i])
 
+        self._rebuild_bar_chart()
+
+
+class CoggingCalibrationTab(QWidget):
+    """Cogging Calibration tab — Start calibration button, auto PID tune checkbox,
+    and multi-RPM profile settings using firmware commands.
+
+    Firmware commands used:
+      - coggingCalibCount: get/set number of profiles (1-5)
+      - coggingCalibRPM: getat/setat RPM target per profile (adr=profile_idx, val=RPM*10)
+      - coggingCalibIters: getat/setat iterations per profile (adr=profile_idx, val=iterations)
+      - coggingCalibPidP/I/D: getat/setat manual PID per profile (adr=profile_idx, val=PID*1000)
+      - coggingCalibAutoPid: get/set auto PID tune flag (1=auto, 0=manual)
+    """
+
+    MAX_RPM_PROFILES = 5
+
+    def __init__(self, tmc_ui, axis):
+        super().__init__()
+        self.tmc_ui = tmc_ui
+        self.axis = axis
+        self.rpm_profile_widgets = []  # [(rpm_spin, iters_spin, p_spin, i_spin, d_spin), ...]
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+
+        # ---- Calibration button ----
+        self.btn_start = QPushButton("Start Cogging Calibration")
+        self.btn_start.setToolTip("Begin the cogging detection / calibration routine")
+        self.btn_start.clicked.connect(self._on_start_calibration)
+        layout.addWidget(self.btn_start)
+
+        # ---- Auto Velocity PID Tune checkbox ----
+        self.chk_auto_pid = QCheckBox("Auto Velocity PID Tune")
+        self.chk_auto_pid.setChecked(True)
+        self.chk_auto_pid.setToolTip("When ticked, velocity PID is auto-tuned during calibration. "
+                                      "Untick to manually set velocity PID per profile below.")
+        self.chk_auto_pid.toggled.connect(self._on_auto_pid_toggled)
+        layout.addWidget(self.chk_auto_pid)
+
+        # ---- Multi-RPM calibration settings ----
+        rpm_group = QGroupBox("Multi-RPM Calibration Settings")
+        rpm_vbox = QVBoxLayout(rpm_group)
+
+        num_row = QHBoxLayout()
+        num_row.addWidget(QLabel("Number of RPM profiles (firmware):"))
+        self.lbl_num_rpms = QLabel("3")
+        self.lbl_num_rpms.setStyleSheet("font-weight: bold; font-size: 14px;")
+        num_row.addWidget(self.lbl_num_rpms)
+        num_row.addStretch(1)
+        rpm_vbox.addLayout(num_row)
+        self._num_rpms = 3  # read-only, queried from firmware
+
+        self.rpm_scroll = QScrollArea()
+        self.rpm_scroll.setWidgetResizable(True)
+        self.rpm_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.rpm_container = QWidget()
+        self.rpm_container_layout = QVBoxLayout(self.rpm_container)
+        self.rpm_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.rpm_scroll.setWidget(self.rpm_container)
+        self.rpm_scroll.setMinimumHeight(60)
+        self.rpm_scroll.setMaximumHeight(400)
+        rpm_vbox.addWidget(self.rpm_scroll)
+
+        layout.addWidget(rpm_group)
+        layout.addStretch(1)
+
+        self._rebuild_rpm_profiles()
+        self._update_enabled_state()
+        self._load_all_from_firmware()
+
+    def _on_auto_pid_toggled(self, checked):
+        """When auto-tune is ticked, grey out per-profile PID spinboxes and send to firmware."""
+        for rpm_spin, iters_spin, p_spin, i_spin, d_spin in self.rpm_profile_widgets:
+            p_spin.setEnabled(not checked)
+            i_spin.setEnabled(not checked)
+            d_spin.setEnabled(not checked)
+        self.tmc_ui.send_value("tmc", "coggingCalibAutoPid", val=1 if checked else 0, instance=self.axis)
+        if not checked:
+            # Send current manual PID values to firmware when switching to manual
+            for i, (rpm_spin, iters_spin, p_spin, i_spin, d_spin) in enumerate(self.rpm_profile_widgets):
+                self.tmc_ui.send_value("tmc", "coggingCalibPidP", adr=i, val=p_spin.value(), instance=self.axis)
+                self.tmc_ui.send_value("tmc", "coggingCalibPidI", adr=i, val=i_spin.value(), instance=self.axis)
+                self.tmc_ui.send_value("tmc", "coggingCalibPidD", adr=i, val=d_spin.value(), instance=self.axis)
+
+    def _on_num_rpms_received(self, val):
+        """Called when firmware reports the number of profiles (read-only)."""
+        try:
+            v = int(val)
+            if 1 <= v <= self.MAX_RPM_PROFILES:
+                self._num_rpms = v
+                self.lbl_num_rpms.setText(str(v))
+                self._rebuild_rpm_profiles()
+        except Exception:
+            pass
+
+    def _rebuild_rpm_profiles(self):
+        # Clear existing
+        for group in self.rpm_profile_widgets:
+            for w in group:
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+        while self.rpm_container_layout.count():
+            item = self.rpm_container_layout.takeAt(0)
+            if item.widget():
+                try:
+                    item.widget().deleteLater()
+                except Exception:
+                    pass
+            elif item.layout():
+                self._clear_layout(item.layout())
+        self.rpm_profile_widgets = []
+
+        num = self._num_rpms
+        auto_pid = self.chk_auto_pid.isChecked()
+
+        # Use horizontal layout so multiple profiles can fit side by side
+        profiles_row = QHBoxLayout()
+        self.rpm_container_layout.addLayout(profiles_row)
+
+        for i in range(num):
+            grp = QGroupBox(f"RPM#{i+1}")
+            form = QFormLayout(grp)
+            form.setContentsMargins(3, 3, 3, 3)
+
+            rpm_spin = QSpinBox()
+            rpm_spin.setRange(1, 500)
+            rpm_spin.setSuffix(" RPM")
+            rpm_spin.setValue(3 if i == 0 else (30 if i == 1 else 100))
+            rpm_spin.setToolTip(f"Target RPM for RPM#{i+1}")
+            rpm_spin.setMaximumWidth(100)
+            idx = i
+            rpm_spin.valueChanged.connect(lambda v, i2=idx: self._on_rpm_changed(i2, v))
+            form.addRow("RPM:", rpm_spin)
+
+            iters_spin = QSpinBox()
+            iters_spin.setRange(1, 100)
+            iters_spin.setValue(3)
+            iters_spin.setToolTip(f"DFT iterations for RPM#{i+1}")
+            iters_spin.setMaximumWidth(70)
+            iters_spin.valueChanged.connect(lambda v, i2=idx: self._on_iters_changed(i2, v))
+            form.addRow("Iters:", iters_spin)
+
+            p_spin = QSpinBox()
+            p_spin.setRange(0, 9999999)
+            p_spin.setSingleStep(100)
+            p_spin.setValue(10000)
+            p_spin.setEnabled(not auto_pid)
+            p_spin.setMaximumWidth(100)
+            p_spin.setToolTip(f"Manual P gain for RPM#{i+1}")
+            p_spin.valueChanged.connect(lambda v, i2=idx: self._on_profile_pid_changed(i2, "coggingCalibPidP", v))
+            form.addRow("P:", p_spin)
+
+            i_spin = QSpinBox()
+            i_spin.setRange(0, 9999999)
+            i_spin.setSingleStep(10)
+            i_spin.setValue(0)
+            i_spin.setEnabled(not auto_pid)
+            i_spin.setMaximumWidth(100)
+            i_spin.setToolTip(f"Manual I gain for RPM#{i+1}")
+            i_spin.valueChanged.connect(lambda v, i2=idx: self._on_profile_pid_changed(i2, "coggingCalibPidI", v))
+            form.addRow("I:", i_spin)
+
+            d_spin = QSpinBox()
+            d_spin.setRange(0, 9999999)
+            d_spin.setSingleStep(10)
+            d_spin.setValue(0)
+            d_spin.setEnabled(not auto_pid)
+            d_spin.setMaximumWidth(100)
+            d_spin.setToolTip(f"Manual D gain for RPM#{i+1}")
+            d_spin.valueChanged.connect(lambda v, i2=idx: self._on_profile_pid_changed(i2, "coggingCalibPidD", v))
+            form.addRow("D:", d_spin)
+
+            profiles_row.addWidget(grp)
+            self.rpm_profile_widgets.append((rpm_spin, iters_spin, p_spin, i_spin, d_spin))
+
+        profiles_row.addStretch(1)
+
+    def _on_rpm_changed(self, profile_idx, val):
+        if self._loading:
+            return
+        self.tmc_ui.send_value("tmc", "coggingCalibRPM", adr=profile_idx, val=val * 10, instance=self.axis)
+
+    def _on_iters_changed(self, profile_idx, val):
+        if self._loading:
+            return
+        self.tmc_ui.send_value("tmc", "coggingCalibIters", adr=profile_idx, val=val, instance=self.axis)
+
+    def _on_profile_pid_changed(self, profile_idx, cmd, val):
+        if self._loading or self.chk_auto_pid.isChecked():
+            return
+        self.tmc_ui.send_value("tmc", cmd, adr=profile_idx, val=val, instance=self.axis)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                try:
+                    item.widget().deleteLater()
+                except Exception:
+                    pass
+            elif item.layout():
+                self._clear_layout(item.layout())
+
+    def _load_all_from_firmware(self):
+        """Query firmware for all multi-RPM calibration profile settings."""
+        # Query profile count (read-only)
+        self.tmc_ui.get_value_async("tmc", "coggingCalibCount", self._on_num_rpms_received, self.axis, int)
+        # Query auto PID flag
+        self.tmc_ui.get_value_async("tmc", "coggingCalibAutoPid", self._auto_pid_cb, self.axis, int)
+        # Query RPM targets and iterations and PIDs for each profile
+        for i in range(self.MAX_RPM_PROFILES):
+            idx = i
+            self.tmc_ui.get_value_async("tmc", "coggingCalibRPM", lambda v, i2=idx: self._rpm_cb(i2, v), self.axis, int, adr=i)
+            self.tmc_ui.get_value_async("tmc", "coggingCalibIters", lambda v, i2=idx: self._iters_cb(i2, v), self.axis, int, adr=i)
+            self.tmc_ui.get_value_async("tmc", "coggingCalibPidP", lambda v, i2=idx: self._pid_cb(i2, "P", v), self.axis, int, adr=i)
+            self.tmc_ui.get_value_async("tmc", "coggingCalibPidI", lambda v, i2=idx: self._pid_cb(i2, "I", v), self.axis, int, adr=i)
+            self.tmc_ui.get_value_async("tmc", "coggingCalibPidD", lambda v, i2=idx: self._pid_cb(i2, "D", v), self.axis, int, adr=i)
+
+    # _count_cb replaced by _on_num_rpms_received
+
+    def _auto_pid_cb(self, val):
+        try:
+            self._loading = True
+            checked = int(val) != 0
+            self.chk_auto_pid.setChecked(checked)
+            self._loading = False
+        except Exception:
+            self._loading = False
+
+    def _rpm_cb(self, idx, val):
+        try:
+            v = int(val) // 10  # RPM*10 from firmware
+            if idx < len(self.rpm_profile_widgets):
+                rpm_spin, _, _, _, _ = self.rpm_profile_widgets[idx]
+                rpm_spin.blockSignals(True)
+                rpm_spin.setValue(v)
+                rpm_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _iters_cb(self, idx, val):
+        try:
+            v = int(val)
+            if idx < len(self.rpm_profile_widgets):
+                _, iters_spin, _, _, _ = self.rpm_profile_widgets[idx]
+                iters_spin.blockSignals(True)
+                iters_spin.setValue(v)
+                iters_spin.blockSignals(False)
+        except Exception:
+            pass
+
+    def _pid_cb(self, idx, pid_type, val):
+        try:
+            v = int(val)
+            if idx < len(self.rpm_profile_widgets):
+                _, _, p_spin, i_spin, d_spin = self.rpm_profile_widgets[idx]
+                target = p_spin if pid_type == "P" else (i_spin if pid_type == "I" else d_spin)
+                target.blockSignals(True)
+                target.setValue(v)
+                target.blockSignals(False)
+        except Exception:
+            pass
+
+    def _update_enabled_state(self):
+        calibrating = getattr(self.tmc_ui, 'cogging_calibrating', False)
+        supported = getattr(self.tmc_ui, 'cogging_supported', False)
+        self.btn_start.setEnabled(supported and not calibrating)
+
+    def _on_start_calibration(self):
+        self.tmc_ui.coggingDetection()
+        self._update_enabled_state()
+        QTimer.singleShot(500, self._update_enabled_state)
+
+    def sync_pid_values(self):
+        """Called when dialog opens — re-fetch current values from firmware."""
+        self._load_all_from_firmware()
+
 
 class ScalePhaseAdvanceDialog(QDialog):
-    """Tabbed editor for the speed-dependent Scale Curve and Phase Advance curve.
+    """Tabbed editor for Cogging Calibration.
 
-    Both curves auto-load from the MCU on open. A live red dot tracks the current
-    RPM and the interpolated value on each chart. Spinbox edits are pushed to the
-    MCU immediately (no manual send button required).
+    Non-modal — you can interact with the main OpenFFBoard window while open.
+    Supports full-screen snapping when dragged to screen edges.
     """
     def __init__(self, tmc_ui, axis):
         super().__init__(tmc_ui)
         self.tmc_ui = tmc_ui
         self.axis = axis
-        self.setWindowTitle("Manual Tuning - Scale & Phase Advance Curves")
+        self.setWindowTitle("Cogging Calibration")
         self.setMinimumSize(720, 560)
+        flags = self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint
+        flags = flags & ~Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
 
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
-        # Scale Curve tab: value range 0..10, MCU encodes *1000
+        # Cogging Calibration tab (FIRST tab)
+        self.cogging_cal_tab = CoggingCalibrationTab(tmc_ui, axis)
+        self.tabs.addTab(self.cogging_cal_tab, "Cogging Calibration")
+
+        # Scale Curve tab
         self.scale_tab = CurveEditorTab(
             tmc_ui, axis, "scaleCurve", "Scale", 0.0, 10.0, 0.1, scale=1000.0, decimals=2)
         self.tabs.addTab(self.scale_tab, "Scale Curve")
 
-        # Phase Advance tab: value in degrees, MCU encodes *100
+        # Phase Advance tab
         self.phase_tab = CurveEditorTab(
             tmc_ui, axis, "phaseAdvCurve", "Phase Advance (deg)", -5.0, 15.0, 0.25, scale=100.0, decimals=2)
         self.tabs.addTab(self.phase_tab, "Phase Advance")
 
-        # 3rd-harmonic waveshaping tab: reshapes the cogging compensation profile.
+        # Harmonic Editor tab
         self.h3_tab = HarmShapingTab(tmc_ui, axis)
         self.tabs.addTab(self.h3_tab, "Harmonic Editor")
 
-        # Live RPM dot polling
+        # Live RPM dot polling (20ms)
         self.live_timer = QTimer(self)
+        self.live_timer.setInterval(20)
         self.live_timer.timeout.connect(self._poll_live)
         self.current_rpm = 0.0
 
-        # Auto-load both curves from MCU on open
         self._load_curves()
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._load_curves()  # re-fetch from MCU every time dialog opens
-        self.live_timer.start(50)
+        self._load_curves()
+        self.live_timer.start()
+        self.cogging_cal_tab._update_enabled_state()
 
     def hideEvent(self, event):
         self.live_timer.stop()
         super().hideEvent(event)
 
+    def closeEvent(self, event):
+        self.live_timer.stop()
+        super().closeEvent(event)
+
     def _load_curves(self):
-        # Register callbacks with typechar='?' to match firmware reply format.
-        # Firmware replies: "[tmc.0.scaleCurve?|3:1000,5:1050,...]"
         self.tmc_ui.register_callback("tmc", "scaleCurve", self._scale_curve_cb, self.axis, str, typechar='?', delete=True)
         self.tmc_ui.register_callback("tmc", "phaseAdvCurve", self._phase_curve_cb, self.axis, str, typechar='?', delete=True)
         self.tmc_ui.send_command("tmc", "scaleCurve", self.axis, '?')
         self.tmc_ui.send_command("tmc", "phaseAdvCurve", self.axis, '?')
-        # Request the harmonic table so the 3rd-harmonic preview can render.
-        # The reply is cached on the main UI (updateCoggingHarmonics); we redraw shortly after.
         self.tmc_ui.send_command("tmc", "coggingHarmonics", self.axis, '?')
         QTimer.singleShot(300, self.h3_tab.redraw)
 
     def _parse_curve(self, data, scale):
-        """Parse 'rpm:int,rpm:int,...' into a list of floats ordered by CurveEditorTab.RPM_POINTS."""
         result = [0.0] * len(CurveEditorTab.RPM_POINTS)
         try:
             for item in str(data).split(","):
@@ -1931,7 +2166,6 @@ class ScalePhaseAdvanceDialog(QDialog):
         self.phase_tab.set_values(vals)
 
     def _poll_live(self):
-        """Read cached RPM from the main tab (updated every 50ms by its own timer)."""
         self.current_rpm = abs(getattr(self.tmc_ui, 'vel_rpm', 0.0))
         self.scale_tab.set_live_rpm(self.current_rpm)
         self.phase_tab.set_live_rpm(self.current_rpm)
@@ -1961,11 +2195,10 @@ class TMC_HW_Version_Selector(OptionsDialogGroupBox,CommunicationHandler):
 
 
     def apply(self):
-        self.send_value("tmc","tmcHwType",self.combobox.currentData(),instance=self.axis) # current data
-        self.parent.init_ui() # Update TMC UI in case capabilities have changed
+        self.send_value("tmc","tmcHwType",self.combobox.currentData(),instance=self.axis)
+        self.parent.init_ui()
     
     def typeCb(self,entries):
-        #print("Reply",entries)
         entriesList = entries.split("\n")
         entriesList = [m.split(":") for m in entriesList if m]
         for m in entriesList:
@@ -1974,4 +2207,3 @@ class TMC_HW_Version_Selector(OptionsDialogGroupBox,CommunicationHandler):
 
     def readValues(self):
         self.get_value_async("tmc","tmcHwType",self.typeCb,self.axis,str,typechar='!')
-
