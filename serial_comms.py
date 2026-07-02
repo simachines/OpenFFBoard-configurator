@@ -195,7 +195,7 @@ class SerialComms(QObject):
                     #print("Ignoring",typechar,callbackObject["typechar"])
                     continue
 
-                if adr != None and adr != callbackObject["address"]:
+                if adr != None and callbackObject["address"] is not None and adr != callbackObject["address"]:
                     #print("Ignoring address",callbackObject,adr)
                     continue
 
