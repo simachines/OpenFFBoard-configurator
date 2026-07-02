@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QMessageBox,QVBoxLayout,QGroupBox,QComboBox,QLabel,QApplication,QDialog,QTextEdit,QPushButton
+from PyQt6.QtWidgets import QMessageBox,QVBoxLayout,QGroupBox,QComboBox,QLabel,QApplication,QDialog,QTextEdit,QPushButton,QFileDialog
 from PyQt6.QtWidgets import QSlider, QDoubleSpinBox, QFormLayout, QHBoxLayout, QWidget, QGridLayout, QSpinBox, QScrollArea, QTabWidget, QSizePolicy, QCheckBox
 from helper import res_path,classlistToIds,updateListComboBox,qtBlockAndCall
 from PyQt6.QtCore import QTime, QTimer
@@ -44,11 +44,11 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.cogging_calibrating = False
         self.cogging_dialog = None
         self.cogging_text = ""
-        self.cogging_harmonics_data_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}  # profile index -> [(order, amplitude, phase), ...]
+        self.cogging_harmonics_data_profiles = {}  # profile index -> [(order, amplitude, phase), ...]
         self.cogging_harmonics_data = []  # [(order, amplitude, phase), ...] — current profile (for backwards compat)
-        self.cogging_rpm_targets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}  # profile index -> measured RPM
-        self._cw_harmonics_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}  # per-profile CW raw harmonics
-        self._ccw_harmonics_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}  # per-profile CCW raw harmonics
+        self.cogging_rpm_targets = {}  # profile index -> measured RPM
+        self._cw_harmonics_profiles = {}  # per-profile CW raw harmonics
+        self._ccw_harmonics_profiles = {}  # per-profile CCW raw harmonics
         self._pending_harmonics_adr = None  # None = no request pending, 0/1/2 = requesting this adr
         self.cogging_profile_count = 3  # cached from firmware
         self.cogging_position = 0.0  # normalized 0-1
@@ -811,8 +811,15 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 try:
                     # "RPM profile 2/3: target 30.0 RPM, 1 iterations ..."
                     prof_part = msg_text[12:].split("/")[0].strip()
-                    self._active_cw_profile = int(prof_part)
-                    self._active_ccw_profile = int(prof_part)
+                    prof_num = int(prof_part)
+                    self._active_cw_profile = prof_num
+                    self._active_ccw_profile = prof_num
+                    # Track max profile seen and update harmonic editor spinbox if needed
+                    if prof_num > self.cogging_profile_count:
+                        self.cogging_profile_count = prof_num
+                        # Update harmonic editor spinbox range if dialog is open
+                        if hasattr(self, '_scale_dlg') and self._scale_dlg is not None:
+                            self._scale_dlg.h3_tab.spin_rpm_profile.setRange(1, prof_num)
                 except Exception:
                     pass
 
@@ -907,21 +914,24 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         if self.tabWidget.widget(index) == self.tabWidget.widget(1):
             self.reloadCoggingTable()
 
-    def clearCoggingGraph(self):
+    def clearCoggingGraph(self, keep_cw_ccw=False):
         self.cogging_data = [0] * 128
         self.cogging_data_received = [False] * 128
-        self.clearCoggingProfile()
+        self.clearCoggingProfile(keep_cw_ccw=keep_cw_ccw)
 
-    def clearCoggingProfile(self):
+    def clearCoggingProfile(self, keep_cw_ccw=False):
+        """Clear cogging profile data. Set keep_cw_ccw=True to preserve CW/CCW per-profile
+        harmonics that were captured during calibration broadcasts."""
         self.cogging_harmonics_data = []
-        self.cogging_harmonics_data_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}
-        self.cogging_rpm_targets = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
-        self.cw_raw_harmonics = []
-        self.ccw_raw_harmonics = []
+        self.cogging_harmonics_data_profiles = {}
+        self.cogging_rpm_targets = {}
+        if not keep_cw_ccw:
+            self.cw_raw_harmonics = []
+            self.ccw_raw_harmonics = []
+            self._cw_harmonics_profiles = {}
+            self._ccw_harmonics_profiles = {}
         self._active_cw_profile = 1  # which profile's CW/CCW is shown
         self._active_ccw_profile = 1
-        self._cw_harmonics_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}
-        self._ccw_harmonics_profiles = {1: [], 2: [], 3: [], 4: [], 5: []}
         self.line_cp_waveform.clear()
         self.line_cp_cw.clear()
         self.line_cp_ccw.clear()
@@ -977,6 +987,11 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.main.log("TMC cogging harmonics parse error: " + str(e))
 
     def updateCwCcwData(self, data):
+        """Handle coggingCwCcw query response from firmware.
+        IMPORTANT: Only stores data if the target profile does NOT already have
+        CW/CCW data from a calibration broadcast. The firmware only keeps the LAST
+        profile's data, so this query response would otherwise overwrite earlier
+        profiles' correctly-captured data."""
         try:
             if not data:
                 return
@@ -1014,11 +1029,12 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                                 if amp > 0.0:
                                     ccw_list.append((order, amp, phase))
 
-            # Store to current profile's CW/CCW data
+            # Only store if the profile doesn't already have calibration-broadcast data
+            # (firmware's single-set coggingCwCcw response only has last profile's data)
             profile_idx = self._active_cw_profile
-            if cw_list:
+            if cw_list and not self._cw_harmonics_profiles.get(profile_idx):
                 self._cw_harmonics_profiles[profile_idx] = cw_list
-            if ccw_list:
+            if ccw_list and not self._ccw_harmonics_profiles.get(profile_idx):
                 self._ccw_harmonics_profiles[profile_idx] = ccw_list
 
             # Always keep the active list updated for the TMC cogging tab chart
@@ -1108,7 +1124,10 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.clearCoggingGraph()
 
     def reloadCoggingTable(self):
-        self.clearCoggingGraph()
+        # Preserve CW/CCW per-profile data captured during calibration broadcasts.
+        # The firmware only keeps the last profile's CW/CCW, so clearing would lose
+        # data for other profiles. Use keep_cw_ccw=True to preserve them.
+        self.clearCoggingGraph(keep_cw_ccw=True)
         self.send_command("tmc", "coggingTable", self.axis, '?')
         self.send_command("tmc", "coggingHarmonics", self.axis, '?')
         self.send_command("tmc", "coggingCwCcw", self.axis, '?')
@@ -1534,7 +1553,7 @@ class HarmShapingTab(QWidget):
         profile_row = QHBoxLayout()
         profile_row.addWidget(QLabel("Edit RPM profile #:"))
         self.spin_rpm_profile = QSpinBox()
-        self.spin_rpm_profile.setRange(1, 5)
+        self.spin_rpm_profile.setRange(1, max(1, tmc_ui.cogging_profile_count))
         self.spin_rpm_profile.setValue(1)
         self.spin_rpm_profile.setToolTip("Select which RPM calibration profile's harmonics to edit")
         self.spin_rpm_profile.valueChanged.connect(self._on_profile_changed)
@@ -1703,6 +1722,21 @@ class HarmShapingTab(QWidget):
         self.chk_show_dir_graphs.toggled.connect(self._on_show_dir_graphs_toggled)
         form.addRow("", self.chk_show_dir_graphs)
 
+        # Download / Copy buttons
+        btn_row = QHBoxLayout()
+        self.btn_download_data = QPushButton("Download CW/CCW Data")
+        self.btn_download_data.setToolTip("Save the current profile's CW, CCW and DFT harmonic "
+                                           "data to a text file")
+        self.btn_download_data.clicked.connect(self._on_download_data)
+        btn_row.addWidget(self.btn_download_data)
+        self.btn_copy_data = QPushButton("Copy to Clipboard")
+        self.btn_copy_data.setToolTip("Copy the current profile's CW, CCW and DFT harmonic "
+                                       "data to the clipboard")
+        self.btn_copy_data.clicked.connect(self._on_copy_data)
+        btn_row.addWidget(self.btn_copy_data)
+        btn_row.addStretch(1)
+        form.addRow("", btn_row)
+
         # CW and CCW direction overlay series
         self._dir_cw_series = QLineSeries()
         self._dir_cw_series.setName("CW Direction")
@@ -1772,6 +1806,9 @@ class HarmShapingTab(QWidget):
                                         self.axis, int, adr=adr)
         else:
             self._current_profile = 1
+        # Refresh CW/CCW direction graphs for the newly selected profile
+        if self.chk_show_dir_graphs.isChecked():
+            self._on_show_dir_graphs_toggled(True)
         self.redraw()
         self._rebuild_bar_chart()
 
@@ -1961,6 +1998,67 @@ class HarmShapingTab(QWidget):
             s.append(float(i), vals[i])
         s.show()
 
+    def _build_data_text(self):
+        """Build a multi-line text report of CW, CCW and DFT harmonics for the current profile."""
+        lines = []
+        idx = self._current_profile
+        lines.append(f"RPM Profile #{idx}")
+        rpm = self.tmc_ui.cogging_rpm_targets.get(idx, 0)
+        lines.append(f"Measured RPM: {rpm}")
+        lines.append("")
+
+        cw = self.tmc_ui._cw_harmonics_profiles.get(idx, [])
+        ccw = self.tmc_ui._ccw_harmonics_profiles.get(idx, [])
+        dft = self.tmc_ui.cogging_harmonics_data_profiles.get(idx, [])
+
+        lines.append("--- CW Direction Harmonics ---")
+        if cw:
+            lines.append("order : amplitude : phase_rad")
+            for order, amp, phase in sorted(cw, key=lambda x: x[0]):
+                lines.append(f"{order} : {amp:.1f} : {phase:.4f}")
+        else:
+            lines.append("(no data)")
+
+        lines.append("")
+        lines.append("--- CCW Direction Harmonics ---")
+        if ccw:
+            lines.append("order : amplitude : phase_rad")
+            for order, amp, phase in sorted(ccw, key=lambda x: x[0]):
+                lines.append(f"{order} : {amp:.1f} : {phase:.4f}")
+        else:
+            lines.append("(no data)")
+
+        lines.append("")
+        lines.append("--- Combined DFT Harmonics ---")
+        if dft:
+            lines.append("order : amplitude : phase_rad")
+            for order, amp, phase in sorted(dft, key=lambda x: x[0]):
+                lines.append(f"{order} : {amp:.1f} : {phase:.4f}")
+        else:
+            lines.append("(no data)")
+
+        return "\n".join(lines)
+
+    def _on_download_data(self):
+        """Save the current profile's CW, CCW and DFT harmonic data to a text file."""
+        text = self._build_data_text()
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "Save CW/CCW Harmonic Data",
+            f"profile_{self._current_profile}_cwccw.txt",
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if fname:
+            try:
+                with open(fname, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError as e:
+                QMessageBox.warning(self, "Save Error", f"Could not save file:\n{e}")
+
+    def _on_copy_data(self):
+        """Copy the current profile's CW, CCW and DFT harmonic data to the clipboard."""
+        text = self._build_data_text()
+        QApplication.clipboard().setText(text)
+
     def _rebuild_bar_chart(self):
         harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
         self.bar_set.remove(0, self.bar_set.count())
@@ -2087,10 +2185,20 @@ class HarmShapingTab(QWidget):
                 v -= shaping * d_amp * math.sin(shaped_arg)
             shaped[i] = v
 
-        self.orig_series.clear()
-        self.shaped_series.clear()
+        # --- compute Y range including visible CW/CCW direction series ---
         y_min = min(min(orig), min(shaped))
         y_max = max(max(orig), max(shaped))
+
+        # if CW/CCW direction graphs are displayed, include their amplitude range
+        if self.chk_show_dir_graphs.isChecked():
+            for s in (self._dir_cw_series, self._dir_ccw_series):
+                if s.isVisible():
+                    pts = s.pointsVector()
+                    if pts:
+                        vals = [p.y() for p in pts]
+                        y_min = min(y_min, min(vals))
+                        y_max = max(y_max, max(vals))
+
         if y_max - y_min < 1e-6:
             y_max = y_min + 1.0
         pad = (y_max - y_min) * 0.1
@@ -2204,8 +2312,12 @@ class CoggingCalibrationTab(QWidget):
             v = int(val)
             if 1 <= v <= self.MAX_RPM_PROFILES:
                 self._num_rpms = v
+                self.tmc_ui.cogging_profile_count = v
                 self.lbl_num_rpms.setText(str(v))
                 self._rebuild_rpm_profiles()
+                # Update harmonic editor spinbox range if the dialog is already open
+                if hasattr(self.tmc_ui, '_scale_dlg') and self.tmc_ui._scale_dlg is not None:
+                    self.tmc_ui._scale_dlg.h3_tab.spin_rpm_profile.setRange(1, v)
         except Exception:
             pass
 
