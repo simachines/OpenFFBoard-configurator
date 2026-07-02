@@ -2256,6 +2256,14 @@ class CoggingCalibrationTab(QWidget):
         self.chk_inertia_corr.toggled.connect(self._on_inertia_corr_toggled)
         layout.addWidget(self.chk_inertia_corr)
 
+        # Friction Feedforward checkbox
+        self.chk_friction_ff = QCheckBox("Friction Feedforward")
+        self.chk_friction_ff.setChecked(False)
+        self.chk_friction_ff.setToolTip("Apply friction feedforward torque (B·ω) during calibration "
+                                         "to reduce friction-induced DFT bias")
+        self.chk_friction_ff.toggled.connect(self._on_friction_ff_toggled)
+        layout.addWidget(self.chk_friction_ff)
+
         # ---- Multi-RPM calibration settings ----
         rpm_group = QGroupBox("Multi-RPM Calibration Settings")
         rpm_vbox = QVBoxLayout(rpm_group)
@@ -2418,6 +2426,19 @@ class CoggingCalibrationTab(QWidget):
     def _on_inertia_corr_toggled(self, checked):
         self.tmc_ui.send_value("tmc", "coggingCalibInertiaCorr", val=1 if checked else 0, instance=self.axis)
 
+    def _on_friction_ff_toggled(self, checked):
+        self.tmc_ui.send_value("tmc", "coggingCalibFrictionFF", val=1 if checked else 0, instance=self.axis)
+
+    def _friction_ff_cb(self, val):
+        """Callback for coggingCalibFrictionFF query."""
+        try:
+            self._loading = True
+            checked = int(val) != 0
+            self.chk_friction_ff.setChecked(checked)
+            self._loading = False
+        except Exception:
+            self._loading = False
+
     def _on_profile_pid_changed(self, profile_idx, cmd, val):
         if self._loading or self.chk_auto_pid.isChecked():
             return
@@ -2440,6 +2461,8 @@ class CoggingCalibrationTab(QWidget):
         self.tmc_ui.get_value_async("tmc", "coggingCalibCount", self._on_num_rpms_received, self.axis, int)
         # Query auto PID flag
         self.tmc_ui.get_value_async("tmc", "coggingCalibAutoPid", self._auto_pid_cb, self.axis, int)
+        # Query friction feedforward flag
+        self.tmc_ui.get_value_async("tmc", "coggingCalibFrictionFF", self._friction_ff_cb, self.axis, int)
         # Query RPM targets and iterations and PIDs for each profile
         for i in range(self.MAX_RPM_PROFILES):
             idx = i
