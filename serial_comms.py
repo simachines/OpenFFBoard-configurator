@@ -209,8 +209,8 @@ class SerialComms(QObject):
                 if(callbackObject["convert"]):
                     try:
                         reply = callbackObject["convert"](reply)
-                    except ValueError as e:
-                        self.logger.error("Error converting object: " + str(e))
+                    except (ValueError, TypeError):
+                        continue
                 try:
                     callbackObject["callback"](reply)
                     

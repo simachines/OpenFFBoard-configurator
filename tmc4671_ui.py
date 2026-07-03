@@ -890,14 +890,19 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                             if mag > 0.0:
                                 new_data.append((order, mag, phase))
                     if new_data:
-                        # Update the active tab list for the cogging tab chart
-                        target_list.clear()
-                        target_list.extend(new_data)
-                        # Also store to per-profile dict so it survives across profile switches
+                        # Only keep the FIRST iteration's CW/CCW data per profile.
+                        # Later iterations have the anti-cogging table fed back, so
+                        # the DFT only measures the residual (much smaller amplitude).
                         if is_cw:
-                            self._cw_harmonics_profiles[profile_idx] = list(new_data)
+                            if not self._cw_harmonics_profiles.get(profile_idx):
+                                self._cw_harmonics_profiles[profile_idx] = list(new_data)
+                                target_list.clear()
+                                target_list.extend(new_data)
                         else:
-                            self._ccw_harmonics_profiles[profile_idx] = list(new_data)
+                            if not self._ccw_harmonics_profiles.get(profile_idx):
+                                self._ccw_harmonics_profiles[profile_idx] = list(new_data)
+                                target_list.clear()
+                                target_list.extend(new_data)
                     self.rebuildCwCcwWaveforms()
                 except Exception:
                     pass
@@ -1062,7 +1067,8 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.line_cp_cogging.append(float(deg), float(orange))
             max_amp = max(max_amp, abs(green), abs(orange))
 
-        margin = max(max_amp * 1.2, 10.0)
+        current_max = max(abs(self.chart_cp_Yaxis.min()), abs(self.chart_cp_Yaxis.max()))
+        margin = max(max_amp * 1.2, current_max, 10.0)
         self.chart_cp_Yaxis.setRange(-margin, margin)
         self.updateProfilePosition()
 
@@ -1598,7 +1604,10 @@ class HarmShapingTab(QWidget):
 
         self.shaped_series = QLineSeries()
         self.shaped_series.setName("Shaped")
-        self.shaped_series.setColor(QColor("#da4453"))
+        self.shaped_series.setColor(QColor("limegreen"))
+        pen = self.shaped_series.pen()
+        pen.setWidth(2)
+        self.shaped_series.setPen(pen)
         self.chart_wave.addSeries(self.shaped_series)
         self.shaped_series.attachAxis(self.axisX_wave)
         self.shaped_series.attachAxis(self.axisY_wave)
@@ -1741,10 +1750,6 @@ class HarmShapingTab(QWidget):
         self._dir_cw_series = QLineSeries()
         self._dir_cw_series.setName("CW Direction")
         self._dir_cw_series.setColor(QColor("red"))
-        pen = self._dir_cw_series.pen()
-        pen.setStyle(Qt.PenStyle.DotLine)
-        pen.setWidth(1)
-        self._dir_cw_series.setPen(pen)
         self._dir_cw_series.setOpacity(0.5)
         self.chart_wave.addSeries(self._dir_cw_series)
         self._dir_cw_series.attachAxis(self.axisX_wave)
@@ -1754,10 +1759,6 @@ class HarmShapingTab(QWidget):
         self._dir_ccw_series = QLineSeries()
         self._dir_ccw_series.setName("CCW Direction")
         self._dir_ccw_series.setColor(QColor("dodgerblue"))
-        pen = self._dir_ccw_series.pen()
-        pen.setStyle(Qt.PenStyle.DotLine)
-        pen.setWidth(1)
-        self._dir_ccw_series.setPen(pen)
         self._dir_ccw_series.setOpacity(0.5)
         self.chart_wave.addSeries(self._dir_ccw_series)
         self._dir_ccw_series.attachAxis(self.axisX_wave)
@@ -1794,6 +1795,14 @@ class HarmShapingTab(QWidget):
                 self.tmc_ui.cogging_harmonics_data = list(cached)
                 self._profile_data_loaded = True
                 self.label_profile_info.setText(f"Profile #{val}: cached")
+            elif val > 1:
+                # Profiles 2+ don't have per-profile shaping data (only RPM1 does).
+                # Display Profile 1's combined graph instead.
+                p1_data = self.tmc_ui.cogging_harmonics_data_profiles.get(1, [])
+                self.tmc_ui.cogging_harmonics_data = list(p1_data)
+                self._profile_data_loaded = bool(p1_data)
+                self.label_profile_info.setText(f"Profile #{val}: showing Profile 1 combined"
+                    + (" (cached)" if p1_data else " (not loaded)"))
             else:
                 self._profile_data_loaded = False
                 # Use the persistent callback with _pending_harmonics_adr routing
@@ -1881,9 +1890,9 @@ class HarmShapingTab(QWidget):
         cw = self.tmc_ui._cw_harmonics_profiles.get(self._current_profile, [])
         ccw = self.tmc_ui._ccw_harmonics_profiles.get(self._current_profile, [])
 
+        N = 361  # duplicate 0° at 360° so the chart wraps cleanly
         if cw:
             self._dir_cw_series.show()
-            N = 360
             vals = [0.0] * N
             for order, amp, phase_rad in cw:
                 try:
@@ -1895,7 +1904,7 @@ class HarmShapingTab(QWidget):
                 if amp <= 0:
                     continue
                 for i in range(N):
-                    theta = (i / N) * 2.0 * math.pi
+                    theta = (i / 360.0) * 2.0 * math.pi
                     vals[i] += amp * math.sin(order * theta + phase_rad)
             for i in range(N):
                 self._dir_cw_series.append(float(i), vals[i])
@@ -1904,7 +1913,6 @@ class HarmShapingTab(QWidget):
 
         if ccw:
             self._dir_ccw_series.show()
-            N = 360
             vals = [0.0] * N
             for order, amp, phase_rad in ccw:
                 try:
@@ -1916,7 +1924,7 @@ class HarmShapingTab(QWidget):
                 if amp <= 0:
                     continue
                 for i in range(N):
-                    theta = (i / N) * 2.0 * math.pi
+                    theta = (i / 360.0) * 2.0 * math.pi
                     vals[i] += amp * math.sin(order * theta + phase_rad)
             for i in range(N):
                 self._dir_ccw_series.append(float(i), vals[i])
@@ -2142,6 +2150,9 @@ class HarmShapingTab(QWidget):
         return best
 
     def redraw(self):
+        self.orig_series.clear()
+        self.shaped_series.clear()
+        
         dom = self._dominant_harmonic()
         mult = self.spin_mult.value()
         if dom is not None:
@@ -2171,11 +2182,7 @@ class HarmShapingTab(QWidget):
                 theta = (i / N) * 2.0 * math.pi
                 orig[i] += amp * math.sin(order * theta + phase_rad)
 
-        if not have_data:
-            self.orig_series.clear()
-            self.shaped_series.clear()
-            return
-
+        # Compute shaped first (even if no combined data, CW/CCW may have data)
         for i in range(N):
             theta = (i / N) * 2.0 * math.pi
             v = orig[i]
@@ -2185,6 +2192,10 @@ class HarmShapingTab(QWidget):
                 v -= shaping * d_amp * math.sin(shaped_arg)
             shaped[i] = v
 
+        if not have_data and not self.chk_show_dir_graphs.isChecked():
+            self.axisY_wave.setRange(-1.0, 1.0)
+            return
+
         # --- compute Y range including visible CW/CCW direction series ---
         y_min = min(min(orig), min(shaped))
         y_max = max(max(orig), max(shaped))
@@ -2193,7 +2204,7 @@ class HarmShapingTab(QWidget):
         if self.chk_show_dir_graphs.isChecked():
             for s in (self._dir_cw_series, self._dir_ccw_series):
                 if s.isVisible():
-                    pts = s.pointsVector()
+                    pts = s.points()
                     if pts:
                         vals = [p.y() for p in pts]
                         y_min = min(y_min, min(vals))
