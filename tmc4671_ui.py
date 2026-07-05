@@ -49,6 +49,17 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.cogging_rpm_targets = {}  # profile index -> measured RPM
         self._cw_harmonics_profiles = {}  # per-profile CW raw harmonics
         self._ccw_harmonics_profiles = {}  # per-profile CCW raw harmonics
+        # Spatial bin snapshots from firmware (per-profile, per-direction).
+        # Keys: "cw","ccw","ver_cw","ver_ccw" -> list of 720 float means.
+        self._cw_bins_profiles = {}
+        self._ccw_bins_profiles = {}
+        self._ver_cw_bins_profiles = {}
+        self._ver_ccw_bins_profiles = {}
+        # Verification residual DFT top-20 per profile/direction: [(order,amp,phase),...]
+        self._ver_cw_harm_profiles = {}
+        self._ver_ccw_harm_profiles = {}
+        self._pending_bins_adr = None  # which adr (0-5) is being requested
+        self._profile_cw_lock = {}  # per-profile bool: True=first iteration CW done (stop accumulating)
         self._pending_harmonics_adr = None  # None = no request pending, 0/1/2 = requesting this adr
         self.cogging_profile_count = 3  # cached from firmware
         self.cogging_position = 0.0  # normalized 0-1
@@ -371,6 +382,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         self.register_callback("tmc","coggingShape",self.coggingShapeCb,self.axis,int)
         self.register_callback("tmc","coggingHarmonics",self.updateCoggingHarmonics,self.axis,str)
         self.register_callback("tmc","coggingCwCcw",self.updateCwCcwData,self.axis,str)
+        self.register_callback("tmc","coggingBins",self.updateCoggingBins,self.axis,str)
         
         self.checkBox_combineEncoders.stateChanged.connect(self.extEncoderChanged)
 
@@ -868,8 +880,17 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 for adr in range(0, 5):
                     self._pending_harmonics_adr = adr
                     self.send_command("tmc", "coggingHarmonics", self.axis, '?', adr=adr)
+                # Re-read auto-tuned PID values after calibration completes
+                if hasattr(self, '_scale_dlg') and self._scale_dlg is not None:
+                    self._scale_dlg.cogging_cal_tab.sync_pid_values()
 
-            # Parse CW/CCW silently — store to both the active tab list AND per-profile dict
+            # Parse CW/CCW silently — accumulate chunks per profile.
+            # Firmware broadcasts CW/CCW data in multiple 100-char chunks per
+            # direction per DFT iteration.  CWD: chunks arrive first, then CCWD:.
+            # When we see CWD: after CCWD: has already been stored for this
+            # profile, a new iteration has started — stop accumulating (first
+            # iteration has the full uncompensated cogging; later iterations
+            # have the anti-cogging table fed back as residual).
             if is_cw_ccw:
                 try:
                     is_cw = msg_text.startswith("CWD:")
@@ -877,38 +898,69 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                     data_str = msg_text[len(prefix):]
                     target_list = self.cw_raw_harmonics if is_cw else self.ccw_raw_harmonics
                     profile_idx = self._active_cw_profile
-                    new_data = []
-                    for chunk in data_str.split(","):
-                        chunk = chunk.strip()
-                        if not chunk:
-                            continue
-                        parts = chunk.split(":")
-                        if len(parts) == 3:
-                            order = int(parts[0])
-                            mag = float(parts[1])
-                            phase = float(parts[2]) / 1000.0
-                            if mag > 0.0:
-                                new_data.append((order, mag, phase))
-                    if new_data:
-                        # Only keep the FIRST iteration's CW/CCW data per profile.
-                        # Later iterations have the anti-cogging table fed back, so
-                        # the DFT only measures the residual (much smaller amplitude).
-                        if is_cw:
-                            if not self._cw_harmonics_profiles.get(profile_idx):
-                                self._cw_harmonics_profiles[profile_idx] = list(new_data)
+
+                    # Detect new iteration: CWD: after CCW already stored
+                    if is_cw and self._profile_cw_lock.get(profile_idx, False):
+                        # Don't store — this is iteration 2+ (residual)
+                        pass
+                    else:
+                        new_data = []
+                        for chunk in data_str.split(","):
+                            chunk = chunk.strip()
+                            if not chunk:
+                                continue
+                            parts = chunk.split(":")
+                            if len(parts) == 3:
+                                order = int(parts[0])
+                                mag = float(parts[1])
+                                phase = float(parts[2]) / 1000.0
+                                if mag > 0.0:
+                                    new_data.append((order, mag, phase))
+                        if new_data:
+                            if is_cw:
+                                existing = self._cw_harmonics_profiles.get(profile_idx, [])
+                                existing_orders = {h[0] for h in existing}
+                                for entry in new_data:
+                                    if entry[0] not in existing_orders:
+                                        existing.append(entry)
+                                        existing_orders.add(entry[0])
+                                self._cw_harmonics_profiles[profile_idx] = existing
                                 target_list.clear()
-                                target_list.extend(new_data)
-                        else:
-                            if not self._ccw_harmonics_profiles.get(profile_idx):
-                                self._ccw_harmonics_profiles[profile_idx] = list(new_data)
+                                target_list.extend(existing)
+                            else:
+                                existing = self._ccw_harmonics_profiles.get(profile_idx, [])
+                                existing_orders = {h[0] for h in existing}
+                                for entry in new_data:
+                                    if entry[0] not in existing_orders:
+                                        existing.append(entry)
+                                        existing_orders.add(entry[0])
+                                self._ccw_harmonics_profiles[profile_idx] = existing
                                 target_list.clear()
-                                target_list.extend(new_data)
+                                target_list.extend(existing)
+                                # CCW data complete for this iteration — lock CW
+                                self._profile_cw_lock[profile_idx] = True
                     self.rebuildCwCcwWaveforms()
                 except Exception:
                     pass
         
     def coggingDetection(self):
         self.cogging_calibrating = True
+        # Clear locally cached CW/CCW/DFT data from previous calibrations
+        self._cw_harmonics_profiles.clear()
+        self._ccw_harmonics_profiles.clear()
+        self._profile_cw_lock.clear()
+        self._cw_bins_profiles.clear()
+        self._ccw_bins_profiles.clear()
+        self._ver_cw_bins_profiles.clear()
+        self._ver_ccw_bins_profiles.clear()
+        self._ver_cw_harm_profiles.clear()
+        self._ver_ccw_harm_profiles.clear()
+        self.cogging_harmonics_data_profiles.clear()
+        self.cw_raw_harmonics.clear()
+        self.ccw_raw_harmonics.clear()
+        self.cogging_harmonics_data.clear()
+        self.cogging_rpm_targets.clear()
+        self.clearCoggingGraph()
         self.timer.stop()
         self.timer_status.stop()
         self.timer_pos.stop()
@@ -928,9 +980,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         """Clear cogging profile data. Set keep_cw_ccw=True to preserve CW/CCW per-profile
         harmonics that were captured during calibration broadcasts."""
         self.cogging_harmonics_data = []
-        self.cogging_harmonics_data_profiles = {}
-        self.cogging_rpm_targets = {}
         if not keep_cw_ccw:
+            self.cogging_harmonics_data_profiles = {}
+            self.cogging_rpm_targets = {}
             self.cw_raw_harmonics = []
             self.ccw_raw_harmonics = []
             self._cw_harmonics_profiles = {}
@@ -961,6 +1013,18 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
 
     def updateCoggingHarmonics(self, data):
         try:
+            # Detect spontaneous broadcast with "profile:N:" prefix from firmware
+            # (sent immediately after each RPM profile's DFT completes during calibration)
+            broadcast_profile = None
+            if isinstance(data, str) and data.startswith("profile:"):
+                parts = data.split(":", 2)
+                if len(parts) >= 3:
+                    try:
+                        broadcast_profile = int(parts[1])
+                        data = parts[2]  # remainder is the actual harmonic data
+                    except ValueError:
+                        pass
+
             if not data or data == "0:0:0":
                 self.cogging_harmonics_data = []
             else:
@@ -975,7 +1039,18 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                             harmonics.append((order, amp, phase))
                 self.cogging_harmonics_data = harmonics
 
-            # Route to pending profile request if active
+            # Handle spontaneous broadcast: store in per-profile map immediately
+            if broadcast_profile is not None:
+                self.cogging_harmonics_data_profiles[broadcast_profile] = list(self.cogging_harmonics_data)
+                # Notify the HarmShapingTab if dialog is open
+                if hasattr(self, '_scale_dlg') and self._scale_dlg is not None:
+                    self._scale_dlg.h3_tab._profile_data_loaded = True
+                    self._scale_dlg.h3_tab._y_range_locked = False
+                    self._scale_dlg.h3_tab.redraw()
+                    self._scale_dlg.h3_tab._rebuild_bar_chart()
+                    self._scale_dlg.h3_tab._rebuild_magnitude_editors()
+
+            # Route to pending profile request if active (solicited query)
             if self._pending_harmonics_adr is not None:
                 profile_idx = self._pending_harmonics_adr + 1
                 self.cogging_harmonics_data_profiles[profile_idx] = list(self.cogging_harmonics_data)
@@ -983,8 +1058,10 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 # Notify the HarmShapingTab if dialog is open
                 if hasattr(self, '_scale_dlg') and self._scale_dlg is not None:
                     self._scale_dlg.h3_tab._profile_data_loaded = True
+                    self._scale_dlg.h3_tab._y_range_locked = False
                     self._scale_dlg.h3_tab.redraw()
                     self._scale_dlg.h3_tab._rebuild_bar_chart()
+                    self._scale_dlg.h3_tab._rebuild_magnitude_editors()
 
             self.syncHarmonicEditor()
             self.updateHarmonicPreview()
@@ -1048,6 +1125,89 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.rebuildCwCcwWaveforms()
         except Exception as e:
             self.main.log("TMC CW/CCW parse error: " + str(e))
+
+    def updateCoggingBins(self, data):
+        """Handle coggingBins chunked response from firmware.
+        Each reply is self-describing via a 'B<adr>:' prefix:
+          adr 0-3: 'B<adr>:item:<offset>,data:(v0,v1,...)' repeated chunks
+          adr 4-5: 'B<adr>:order:amp:phase,order:amp:phase,...' (top-20 DFT)
+        Special: 'NOBINS' means no bin data available."""
+        try:
+            if not data:
+                return
+            if data == "NOBINS":
+                self._pending_bins_adr = None
+                return
+            profile_idx = self._active_cw_profile
+            # Parse the 'B<adr>:' prefix.
+            if not data.startswith("B"):
+                return
+            colon = data.find(":")
+            if colon < 0:
+                return
+            try:
+                adr = int(data[1:colon])
+            except ValueError:
+                return
+            payload = data[colon + 1:]
+
+            if adr <= 3:
+                # Bin array chunk: 'item:<off>,data:(v0,v1,...)'
+                if not payload.startswith("item:"):
+                    return
+                comma = payload.find(",")
+                if comma < 0:
+                    return
+                off = int(payload[5:comma])
+                data_part = payload[comma + 1:]
+                if not data_part.startswith("data:("):
+                    return
+                vals_str = data_part[6:].rstrip(")")
+                vals = [int(v) for v in vals_str.split(",") if v]
+
+                # Pick the right per-profile dict
+                if adr == 0:
+                    d = self._cw_bins_profiles.setdefault(profile_idx, [0.0] * 720)
+                elif adr == 1:
+                    d = self._ccw_bins_profiles.setdefault(profile_idx, [0.0] * 720)
+                elif adr == 2:
+                    d = self._ver_cw_bins_profiles.setdefault(profile_idx, [0.0] * 720)
+                else:
+                    d = self._ver_ccw_bins_profiles.setdefault(profile_idx, [0.0] * 720)
+                for i, v in enumerate(vals):
+                    idx = off + i
+                    if 0 <= idx < 720:
+                        d[idx] = float(v)
+            elif adr == 4 or adr == 5:
+                # Verification top-20 DFT
+                harm_list = []
+                if payload != "0:0:0":
+                    for item in payload.split(","):
+                        item = item.strip()
+                        if not item:
+                            continue
+                        parts = item.split(":")
+                        if len(parts) == 3:
+                            order = int(parts[0])
+                            amp = float(parts[1])
+                            phase = float(parts[2]) / 1000.0
+                            if amp > 0.0:
+                                harm_list.append((order, amp, phase))
+                if adr == 4:
+                    self._ver_cw_harm_profiles[profile_idx] = harm_list
+                else:
+                    self._ver_ccw_harm_profiles[profile_idx] = harm_list
+        except Exception as e:
+            self.main.log("TMC coggingBins parse error: " + str(e))
+
+    def requestCoggingBins(self, profile_idx=None):
+        """Request all bin datasets from firmware for the given (or current) profile."""
+        if profile_idx is None:
+            profile_idx = self._active_cw_profile
+        self._active_cw_profile = profile_idx
+        for adr in range(0, 6):
+            self._pending_bins_adr = adr
+            self.send_command("tmc", "coggingBins", self.axis, '?', adr=adr)
 
     def rebuildProfileWaveform(self):
         self.line_cp_waveform.clear()
@@ -1133,10 +1293,14 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         # Preserve CW/CCW per-profile data captured during calibration broadcasts.
         # The firmware only keeps the last profile's CW/CCW, so clearing would lose
         # data for other profiles. Use keep_cw_ccw=True to preserve them.
+        # Do NOT query coggingCwCcw here — the firmware only has the LAST
+        # profile's data in cw_store/ccw_store, and _active_cw_profile defaults
+        # to 1 on restart.  That would overwrite profile 1's data with the last
+        # profile's harmonics.
         self.clearCoggingGraph(keep_cw_ccw=True)
         self.send_command("tmc", "coggingTable", self.axis, '?')
-        self.send_command("tmc", "coggingHarmonics", self.axis, '?')
-        self.send_command("tmc", "coggingCwCcw", self.axis, '?')
+        self._pending_harmonics_adr = 0
+        self.send_command("tmc", "coggingHarmonics", self.axis, '?', adr=0)
 
     def coggingScaleCb(self, val):
         pass
@@ -1612,25 +1776,25 @@ class HarmShapingTab(QWidget):
         self.shaped_series.attachAxis(self.axisX_wave)
         self.shaped_series.attachAxis(self.axisY_wave)
 
-        # Multi-profile overlay series (dashed, colored by profile index)
-        # Colors for profile overlay lines: profile2=orange, profile3=green, profile4=purple, profile5=brown
-        self._overlay_colors = {2: QColor("#e67e22"), 3: QColor("#27ae60"),
-                                4: QColor("#8e44ad"), 5: QColor("#a0522d")}
-        self._overlay_series = {}  # profile_idx -> QLineSeries
-        for pidx in range(2, 6):
-            s = QLineSeries()
-            s.setName(f"RPM Profile #{pidx}")
-            s.setColor(self._overlay_colors[pidx])
-            pen = s.pen()
-            pen.setStyle(Qt.PenStyle.DashLine)
-            pen.setWidth(1)
-            s.setPen(pen)
-            s.setOpacity(0.55)
-            self.chart_wave.addSeries(s)
-            s.attachAxis(self.axisX_wave)
-            s.attachAxis(self.axisY_wave)
-            s.hide()
-            self._overlay_series[pidx] = s
+        # Position dot (live position marker on waveform)
+        self.scatter_pos = QScatterSeries()
+        self.scatter_pos.setName("Position")
+        self.scatter_pos.setColor(QColor("red"))
+        self.scatter_pos.setMarkerSize(10)
+        self.chart_wave.addSeries(self.scatter_pos)
+        self.scatter_pos.attachAxis(self.axisX_wave)
+        self.scatter_pos.attachAxis(self.axisY_wave)
+
+        # Vertical position line
+        self.line_vmarker = QLineSeries()
+        self.line_vmarker.setName("")
+        self.line_vmarker.setColor(QColor("red"))
+        pen = self.line_vmarker.pen()
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.line_vmarker.setPen(pen)
+        self.chart_wave.addSeries(self.line_vmarker)
+        self.line_vmarker.attachAxis(self.axisX_wave)
+        self.line_vmarker.attachAxis(self.axisY_wave)
 
         self.view_wave = QChartView(self.chart_wave)
         self.view_wave.setMinimumHeight(240)
@@ -1669,42 +1833,18 @@ class HarmShapingTab(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self.slider_shaping = QSlider(Qt.Orientation.Horizontal)
-        self.slider_shaping.setRange(-100, 100)
-        self.slider_shaping.setValue(0)
-        self.slider_shaping.valueChanged.connect(self._on_shaping_slider)
-        shaping_row = QHBoxLayout()
-        shaping_row.addWidget(self.slider_shaping, 1)
-        self.spin_shaping = QDoubleSpinBox()
-        self.spin_shaping.setRange(-1.0, 1.0)
-        self.spin_shaping.setSingleStep(0.01)
-        self.spin_shaping.setDecimals(3)
-        self.spin_shaping.setSuffix("")
-        self.spin_shaping.valueChanged.connect(self._on_shaping_spin)
-        shaping_row.addWidget(self.spin_shaping)
-        shaping_w = QWidget()
-        shaping_w.setLayout(shaping_row)
-        form.addRow("Shaping (+ = subtract, thin peaks):", shaping_w)
-
-        self.spin_mult = QSpinBox()
-        self.spin_mult.setRange(1, 31)
-        self.spin_mult.setValue(3)
-        self.spin_mult.valueChanged.connect(self._on_mult_changed)
-        form.addRow("Harmonic multiplier (3 = 3rd):", self.spin_mult)
-
-        self.spin_phase = QDoubleSpinBox()
-        self.spin_phase.setRange(-180.0, 180.0)
-        self.spin_phase.setSingleStep(1.0)
-        self.spin_phase.setDecimals(2)
-        self.spin_phase.setSuffix(" deg")
-        self.spin_phase.setValue(0.0)
-        self.spin_phase.setToolTip("Rotates the shaped harmonic around the electrical revolution "
-                                   "so the peak-shaving effect aligns with the physical detents")
-        self.spin_phase.valueChanged.connect(self._on_phase_changed)
-        form.addRow("Phase trim:", self.spin_phase)
-
-        self.label_dom = QLabel("Dominant order: —")
-        form.addRow("", self.label_dom)
+        # Per-harmonic magnitude editor (scrollable)
+        self.harm_scroll = QScrollArea()
+        self.harm_scroll.setWidgetResizable(True)
+        self.harm_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.harm_scroll.setMinimumHeight(60)
+        self.harm_scroll.setMaximumHeight(260)
+        self.harm_container = QWidget()
+        self.harm_container_layout = QVBoxLayout(self.harm_container)
+        self.harm_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.harm_scroll.setWidget(self.harm_container)
+        self._harm_spinboxes = []  # [(order_label, amp_spinbox), ...]
+        form.addRow("Harmonic magnitudes:", self.harm_scroll)
 
         layout.addLayout(form)
 
@@ -1715,13 +1855,10 @@ class HarmShapingTab(QWidget):
         self.label_profile_info = QLabel("")
         form.addRow("", self.label_profile_info)
 
-        # "Show all RPM profiles" checkbox
-        self.chk_show_all_profiles = QCheckBox("Show all RPM profiles on chart")
-        self.chk_show_all_profiles.setChecked(False)
-        self.chk_show_all_profiles.setToolTip("Overlay original waveforms from all RPM profiles "
-                                               "on the chart simultaneously")
-        self.chk_show_all_profiles.toggled.connect(self._on_show_all_profiles_toggled)
-        form.addRow("", self.chk_show_all_profiles)
+        # Angle readout (live position in degrees)
+        self.label_angle = QLabel("Angle: ---°")
+        self.label_angle.setStyleSheet("font-weight: bold; font-size: 13px;")
+        form.addRow("", self.label_angle)
 
         # "Show CW/CCW direction graphs" checkbox
         self.chk_show_dir_graphs = QCheckBox("Show CW/CCW direction graphs")
@@ -1743,6 +1880,27 @@ class HarmShapingTab(QWidget):
                                        "data to the clipboard")
         self.btn_copy_data.clicked.connect(self._on_copy_data)
         btn_row.addWidget(self.btn_copy_data)
+        self.btn_fetch_bins = QPushButton("Fetch Bins")
+        self.btn_fetch_bins.setToolTip("Request the per-direction spatial bin snapshots and "
+                                       "verification residual DFTs from the firmware for the "
+                                       "current profile. Required before Download/Copy can "
+                                       "include bin data.")
+        self.btn_fetch_bins.clicked.connect(self._on_fetch_bins)
+        btn_row.addWidget(self.btn_fetch_bins)
+        self.btn_load_data = QPushButton("Load from File")
+        self.btn_load_data.setToolTip("Restore CW, CCW and DFT harmonics from a previously saved file")
+        self.btn_load_data.clicked.connect(self._on_load_data)
+        btn_row.addWidget(self.btn_load_data)
+        self.btn_clear_cached = QPushButton("Clear Cached")
+        self.btn_clear_cached.setToolTip("Clear all locally cached CW/CCW/DFT harmonic data")
+        self.btn_clear_cached.clicked.connect(self._on_clear_cached)
+        btn_row.addWidget(self.btn_clear_cached)
+        self.btn_apply_fw = QPushButton("Apply to Firmware")
+        self.btn_apply_fw.setToolTip("Send the edited harmonic magnitudes to the firmware "
+                                      "so they take effect on the motor")
+        self.btn_apply_fw.setStyleSheet("QPushButton { font-weight: bold; color: #27ae60; }")
+        self.btn_apply_fw.clicked.connect(self._on_apply_to_firmware)
+        btn_row.addWidget(self.btn_apply_fw)
         btn_row.addStretch(1)
         form.addRow("", btn_row)
 
@@ -1770,7 +1928,7 @@ class HarmShapingTab(QWidget):
         self.chart_wave.setBackgroundBrush(palette_color)
         self.chart_bars.setBackgroundBrush(palette_color)
 
-        self._load_from_mcu()
+        self._rebuild_magnitude_editors()
 
     def _on_view_changed(self, idx):
         if idx == 0:
@@ -1818,8 +1976,10 @@ class HarmShapingTab(QWidget):
         # Refresh CW/CCW direction graphs for the newly selected profile
         if self.chk_show_dir_graphs.isChecked():
             self._on_show_dir_graphs_toggled(True)
+        self._y_range_locked = False
         self.redraw()
         self._rebuild_bar_chart()
+        self._rebuild_magnitude_editors()
 
     def _on_profile_harmonics_loaded(self, data):
         """Callback when firmware returns harmonics for a specific RPM profile."""
@@ -1844,8 +2004,10 @@ class HarmShapingTab(QWidget):
             self._profile_data_loaded = True
         except Exception:
             pass
+        self._y_range_locked = False
         self.redraw()
         self._rebuild_bar_chart()
+        self._rebuild_magnitude_editors()
 
     def _on_rpm_target_received(self, profile_idx, val):
         """Callback for coggingCalibRPM query — updates per-profile RPM display."""
@@ -1853,26 +2015,8 @@ class HarmShapingTab(QWidget):
             rpm = int(val) // 10  # RPM*10 from firmware
             if rpm > 0:
                 self.tmc_ui.cogging_rpm_targets[profile_idx] = rpm
-                if profile_idx == self._current_profile:
-                    # Blend info: profile 1 is the base; profile 2 blends 1→2 at RPM[1],
-                    # profile 3 blends 2→3 at RPM[2]
-                    blend_info = ""
-                    if profile_idx == 1:
-                        rpm2 = self.tmc_ui.cogging_rpm_targets.get(2, 0)
-                        blend_info = f", blends to profile 2 at {rpm2} RPM" if rpm2 > 0 else ""
-                    elif profile_idx == 2:
-                        rpm1 = self.tmc_ui.cogging_rpm_targets.get(1, 0)
-                        rpm3 = self.tmc_ui.cogging_rpm_targets.get(3, 0)
-                        b_parts = []
-                        if rpm1 > 0:
-                            b_parts.append(f"blends from profile 1 at {rpm1} RPM")
-                        if rpm3 > 0:
-                            b_parts.append(f"blends to profile 3 at {rpm3} RPM")
-                        blend_info = ", " + ", ".join(b_parts) if b_parts else ""
-                    elif profile_idx >= 3:
-                        rpm2 = self.tmc_ui.cogging_rpm_targets.get(2, 0)
-                        blend_info = f", blends from profile 2 at {rpm2} RPM" if rpm2 > 0 else ""
-                    self.label_profile_info.setText(f"Profile #{profile_idx}: measured at {rpm} RPM{blend_info}")
+                if profile_idx == self._current_profile and rpm > 0:
+                    self.label_profile_info.setText(f"Profile #{profile_idx}: measured at {rpm} RPM")
         except Exception:
             pass
 
@@ -1933,81 +2077,23 @@ class HarmShapingTab(QWidget):
 
         self.redraw()
 
-    def _on_show_all_profiles_toggled(self, checked):
-        """When checked, request harmonic data for all RPM profiles from firmware
-        and show them as overlaid dashed lines on the waveform chart."""
-        if checked:
-            # Use cached data or send_command with pending_adr routing
-            for adr in range(1, 5):
-                profile_idx = adr + 1
-                cached = self.tmc_ui.cogging_harmonics_data_profiles.get(profile_idx, [])
-                if cached:
-                    self._redraw_overlay_profile(profile_idx)
-                else:
-                    # Send a request — the persistent callback routes via _pending_harmonics_adr
-                    # but since multiple requests could race, use a small delay between them
-                    def req(a):
-                        self.tmc_ui._pending_harmonics_adr = a
-                        self.tmc_ui.send_command("tmc", "coggingHarmonics", self.axis, '?', adr=a)
-                    QTimer.singleShot(adr * 100, lambda a=adr: req(a))
-        else:
-            for s in self._overlay_series.values():
-                s.clear()
-                s.hide()
-        self.redraw()
-
-    def _on_overlay_profile_loaded(self, adr, data):
-        """Callback when firmware returns harmonics for an overlay (non-active) profile."""
-        profile_idx = adr + 1  # Convert 0-based adr back to 1-based profile#
-        try:
-            harmonics = []
-            if data and data != "0:0:0":
-                for item in str(data).split(","):
-                    parts = item.split(":")
-                    if len(parts) == 3:
-                        order = int(parts[0])
-                        amp = float(parts[1])
-                        phase = float(parts[2]) / 1000.0
-                        if order > 0 or amp > 0:
-                            harmonics.append((order, amp, phase))
-            # Store per-profile
-            self.tmc_ui.cogging_harmonics_data_profiles[profile_idx] = harmonics
-        except Exception:
-            pass
-        # Update the overlay line for this profile
-        self._redraw_overlay_profile(profile_idx)
-        self.redraw()
-
-    def _redraw_overlay_profile(self, profile_idx):
-        """Plot one overlay profile's harmonic waveform as a dashed line."""
-        harms = self.tmc_ui.cogging_harmonics_data_profiles.get(profile_idx, [])
-        s = self._overlay_series.get(profile_idx)
-        if s is None:
-            return
-        s.clear()
-        if not harms or not self.chk_show_all_profiles.isChecked():
-            s.hide()
-            return
-        N = 360
-        vals = [0.0] * N
-        for order, amp, phase_rad in harms:
-            try:
-                order = int(order)
-                amp = float(amp)
-                phase_rad = float(phase_rad)
-            except Exception:
-                continue
-            if amp <= 0:
-                continue
-            for i in range(N):
-                theta = (i / N) * 2.0 * math.pi
-                vals[i] += amp * math.sin(order * theta + phase_rad)
-        for i in range(N):
-            s.append(float(i), vals[i])
-        s.show()
+    def updateHarmonicPosition(self):
+        """Update the live position dot, vertical line, and angle readout on the waveform chart."""
+        pos_deg = self.tmc_ui.cogging_position * 360.0
+        torque = getattr(self.tmc_ui, 'cogging_measured_torque', 0)
+        y_min = self.axisY_wave.min()
+        y_max = self.axisY_wave.max()
+        self.scatter_pos.clear()
+        self.scatter_pos.append(pos_deg, torque)
+        self.line_vmarker.clear()
+        self.line_vmarker.append(pos_deg, y_min)
+        self.line_vmarker.append(pos_deg, y_max)
+        if hasattr(self, 'label_angle'):
+            self.label_angle.setText(f"Angle: {pos_deg:.1f}°")
 
     def _build_data_text(self):
-        """Build a multi-line text report of CW, CCW and DFT harmonics for the current profile."""
+        """Build a multi-line text report of CW, CCW, DFT harmonics, spatial bins,
+        and verification residual DFTs/bins for the current profile."""
         lines = []
         idx = self._current_profile
         lines.append(f"RPM Profile #{idx}")
@@ -2015,9 +2101,15 @@ class HarmShapingTab(QWidget):
         lines.append(f"Measured RPM: {rpm}")
         lines.append("")
 
-        cw = self.tmc_ui._cw_harmonics_profiles.get(idx, [])
-        ccw = self.tmc_ui._ccw_harmonics_profiles.get(idx, [])
-        dft = self.tmc_ui.cogging_harmonics_data_profiles.get(idx, [])
+        cw = self.tmc_ui._cw_harmonics_profiles.get(idx) or self.tmc_ui.cw_raw_harmonics
+        ccw = self.tmc_ui._ccw_harmonics_profiles.get(idx) or self.tmc_ui.ccw_raw_harmonics
+        dft = self.tmc_ui.cogging_harmonics_data_profiles.get(idx) or self.tmc_ui.cogging_harmonics_data
+        cw_bins = self.tmc_ui._cw_bins_profiles.get(idx)
+        ccw_bins = self.tmc_ui._ccw_bins_profiles.get(idx)
+        ver_cw_bins = self.tmc_ui._ver_cw_bins_profiles.get(idx)
+        ver_ccw_bins = self.tmc_ui._ver_ccw_bins_profiles.get(idx)
+        ver_cw_harm = self.tmc_ui._ver_cw_harm_profiles.get(idx)
+        ver_ccw_harm = self.tmc_ui._ver_ccw_harm_profiles.get(idx)
 
         lines.append("--- CW Direction Harmonics ---")
         if cw:
@@ -2045,6 +2137,46 @@ class HarmShapingTab(QWidget):
         else:
             lines.append("(no data)")
 
+        # Spatial bin snapshots (per-bin mean iq the DFT operated on).
+        # Bins are emitted as 'index:value' pairs on one line each so the file
+        # stays diff-friendly and easy to parse back. 720 lines per direction.
+        def _emit_bins(name, bins):
+            lines.append("")
+            lines.append(f"--- {name} ---")
+            if bins:
+                lines.append("bin_index : mean_iq")
+                for i, v in enumerate(bins):
+                    # Skip trailing zeros only if the whole tail is zero (compactness),
+                    # but emit at least the first 360 to keep shape visible.
+                    lines.append(f"{i} : {v:.1f}")
+            else:
+                lines.append("(no data)")
+
+        _emit_bins("CW Spatial Bins (mean iq per 0.5 deg)", cw_bins)
+        _emit_bins("CCW Spatial Bins (mean iq per 0.5 deg)", ccw_bins)
+
+        # Verification residual (with feedforward active)
+        lines.append("")
+        lines.append("--- Verification CW Residual DFT ---")
+        if ver_cw_harm:
+            lines.append("order : amplitude : phase_rad")
+            for order, amp, phase in sorted(ver_cw_harm, key=lambda x: x[0]):
+                lines.append(f"{order} : {amp:.1f} : {phase:.4f}")
+        else:
+            lines.append("(no data)")
+
+        lines.append("")
+        lines.append("--- Verification CCW Residual DFT ---")
+        if ver_ccw_harm:
+            lines.append("order : amplitude : phase_rad")
+            for order, amp, phase in sorted(ver_ccw_harm, key=lambda x: x[0]):
+                lines.append(f"{order} : {amp:.1f} : {phase:.4f}")
+        else:
+            lines.append("(no data)")
+
+        _emit_bins("Verification CW Residual Bins (mean iq per 0.5 deg)", ver_cw_bins)
+        _emit_bins("Verification CCW Residual Bins (mean iq per 0.5 deg)", ver_ccw_bins)
+
         return "\n".join(lines)
 
     def _on_download_data(self):
@@ -2067,6 +2199,172 @@ class HarmShapingTab(QWidget):
         text = self._build_data_text()
         QApplication.clipboard().setText(text)
 
+    def _on_fetch_bins(self):
+        """Pull all bin datasets from the firmware for the current profile.
+        The firmware only keeps the LAST calibrated profile's bins, so this
+        should be called right after calibration completes and before switching
+        profiles."""
+        self.tmc_ui.requestCoggingBins(self._current_profile)
+        self.tmc_ui.main.log(f"Requested cogging bins for profile {self._current_profile}")
+
+    def _on_load_data(self):
+        """Restore CW, CCW and DFT harmonics from a previously saved text file.
+        Parses the same format produced by Download CW/CCW Data (one profile per file)."""
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Load CW/CCW Harmonic Data",
+            "", "Text Files (*.txt);;All Files (*)"
+        )
+        if not fname:
+            return
+        try:
+            with open(fname, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            QMessageBox.warning(self, "Load Error", f"Could not read file:\n{e}")
+            return
+
+        # Parse the file
+        import re
+        cw_data = []
+        ccw_data = []
+        dft_data = []
+        current_section = None
+        profile_idx = None
+        rpm = 0
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # RPM Profile header
+            m_rpm = re.match(r"^RPM Profile #(\d+)", line)
+            if m_rpm:
+                profile_idx = int(m_rpm.group(1))
+                self._current_profile = profile_idx
+                self.spin_rpm_profile.setValue(max(1, min(profile_idx, self.spin_rpm_profile.maximum())))
+                continue
+            m_meas = re.match(r"^Measured RPM:\s*(\d+)", line)
+            if m_meas:
+                rpm = int(m_meas.group(1))
+                self.tmc_ui.cogging_rpm_targets[profile_idx or 1] = rpm
+                continue
+            # Section markers
+            if line.startswith("--- CW Direction Harmonics ---"):
+                current_section = "CW"
+                continue
+            if line.startswith("--- CCW Direction Harmonics ---"):
+                current_section = "CCW"
+                continue
+            if line.startswith("--- Combined DFT Harmonics ---"):
+                current_section = "DFT"
+                continue
+            if line.startswith("order :"):
+                continue
+            if line == "(no data)":
+                current_section = None
+                continue
+            # Parse harmonic line: "order : amplitude : phase_rad"
+            parts = line.split(":")
+            if len(parts) == 3 and current_section:
+                try:
+                    order = int(parts[0].strip())
+                    amp = float(parts[1].strip())
+                    phase_rad = float(parts[2].strip())
+                    if amp > 0.0:
+                        entry = (order, amp, phase_rad)
+                        if current_section == "CW":
+                            cw_data.append(entry)
+                        elif current_section == "CCW":
+                            ccw_data.append(entry)
+                        elif current_section == "DFT":
+                            dft_data.append(entry)
+                except ValueError:
+                    continue
+
+        if profile_idx is None:
+            profile_idx = self._current_profile
+
+        # Store into the per-profile caches
+        if cw_data:
+            self.tmc_ui._cw_harmonics_profiles[profile_idx] = cw_data
+            self.tmc_ui.cw_raw_harmonics = cw_data
+        if ccw_data:
+            self.tmc_ui._ccw_harmonics_profiles[profile_idx] = ccw_data
+            self.tmc_ui.ccw_raw_harmonics = ccw_data
+        if dft_data:
+            self.tmc_ui.cogging_harmonics_data_profiles[profile_idx] = dft_data
+            self.tmc_ui.cogging_harmonics_data = dft_data
+            self._profile_data_loaded = True
+        elif profile_idx > 1:
+            # Fall back to profile 1's combined if no DFT in file
+            p1_data = self.tmc_ui.cogging_harmonics_data_profiles.get(1, [])
+            self.tmc_ui.cogging_harmonics_data = list(p1_data)
+        self._profile_data_loaded = True
+        self.label_profile_info.setText(f"Profile #{profile_idx}: loaded from file"
+            + (f" ({rpm} RPM)" if rpm > 0 else ""))
+
+        # Refresh all UI
+        self.tmc_ui.rebuildCwCcwWaveforms()
+        self.tmc_ui.rebuildProfileWaveform()
+        self._y_range_locked = False
+        self.redraw()
+        self._rebuild_bar_chart()
+        self._rebuild_magnitude_editors()
+
+    def _on_apply_to_firmware(self):
+        """Send the edited harmonic magnitudes to the firmware.
+        Uses coggingH3 setat: adr=3 clears table, adr=4 sets amplitude+order,
+        adr=5 sets phase."""
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        if not harms:
+            return
+
+        # Clear the base harmonic table first
+        self.tmc_ui.send_value("tmc", "coggingH3", val=0, adr=3, instance=self.axis)
+
+        # Send each harmonic entry
+        for slot, h in enumerate(harms):
+            try:
+                order = int(h[0])
+                amp = float(h[1])
+                phase_rad = float(h[2])
+            except Exception:
+                continue
+            if order <= 0 or amp <= 0:
+                continue
+            if slot >= 20:  # COGGING_HARMONICS_COUNT
+                break
+
+            amp_int = int(round(amp))
+            phase_mrad = int(round(phase_rad * 1000.0))
+
+            # adr=4: slot<<24 | order<<16 | amplitude
+            set_val = (slot << 24) | ((order & 0xFF) << 16) | (amp_int & 0xFFFF)
+            self.tmc_ui.send_value("tmc", "coggingH3", val=set_val, adr=4, instance=self.axis)
+
+            # adr=5: slot<<24 | phase_mrad
+            phase_val = (slot << 24) | (phase_mrad & 0xFFFF)
+            self.tmc_ui.send_value("tmc", "coggingH3", val=phase_val, adr=5, instance=self.axis)
+
+        # Re-enable cogging so the table takes effect
+        self.tmc_ui.send_value("tmc", "cogging", val=1, instance=self.axis)
+
+    def _on_clear_cached(self):
+        """Clear all locally cached CW/CCW/DFT harmonic data."""
+        self.tmc_ui._cw_harmonics_profiles.clear()
+        self.tmc_ui._ccw_harmonics_profiles.clear()
+        self.tmc_ui.cogging_harmonics_data_profiles.clear()
+        self.tmc_ui.cw_raw_harmonics.clear()
+        self.tmc_ui.ccw_raw_harmonics.clear()
+        self.tmc_ui.cogging_harmonics_data.clear()
+        self.tmc_ui.cogging_rpm_targets.clear()
+        self.tmc_ui.clearCoggingGraph()
+        self._profile_data_loaded = False
+        self.label_profile_info.setText("Cached data cleared")
+        self.redraw()
+        self._rebuild_bar_chart()
+        self._rebuild_magnitude_editors()
+
     def _rebuild_bar_chart(self):
         harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
         self.bar_set.remove(0, self.bar_set.count())
@@ -2085,90 +2383,79 @@ class HarmShapingTab(QWidget):
             self.axisY_bars.setMin(0)
             self.axisY_bars.setMax(10)
 
-    def _load_from_mcu(self):
-        self.tmc_ui.get_value_async("tmc", "coggingH3", self._h3_cb, self.axis, str)
-
-    def _h3_cb(self, data):
-        try:
-            parts = str(data).split(":")
-            if len(parts) >= 3:
-                shaping = float(int(parts[0])) / 1000.0
-                phase_mrad = float(int(parts[1]))
-                mult = int(parts[2])
-                self._loading = True
-                self.spin_shaping.setValue(shaping)
-                self.spin_phase.setValue(phase_mrad / 1000.0 * 180.0 / math.pi)
-                if 1 <= mult <= 31:
-                    self.spin_mult.setValue(mult)
-                self.slider_shaping.setValue(int(round(shaping * 100)))
-                self._loading = False
-        except Exception:
-            self._loading = False
-        self.redraw()
-
-    def _on_shaping_slider(self, val):
-        if self._loading:
-            return
-        v = val / 100.0
-        qtBlockAndCall(self.spin_shaping, self.spin_shaping.setValue, v)
-        self._send(0, int(round(v * 1000.0)))
-        self.redraw()
-
-    def _on_shaping_spin(self, val):
-        if self._loading:
-            return
-        qtBlockAndCall(self.slider_shaping, self.slider_shaping.setValue, int(round(val * 100)))
-        self._send(0, int(round(val * 1000.0)))
-        self.redraw()
-
-    def _on_mult_changed(self, val):
-        if self._loading:
-            return
-        self._send(2, int(val))
-        self.redraw()
-
-    def _on_phase_changed(self, val):
-        if self._loading:
-            return
-        mrad = int(round(val * math.pi / 180.0 * 1000.0))
-        self._send(1, mrad)
-        self.redraw()
-
-    def _send(self, adr, val):
-        self.tmc_ui.send_value("tmc", "coggingH3", val=val, adr=adr, instance=self.axis)
-
-    def _dominant_harmonic(self):
-        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
-        best = None
-        for h in harms:
+    def _rebuild_magnitude_editors(self):
+        """Rebuild per-harmonic magnitude spinboxes from current harmonic data."""
+        # Clear existing
+        for order_lbl, amp_spin in self._harm_spinboxes:
             try:
-                order, amp, phase_rad = int(h[0]), float(h[1]), float(h[2])
+                order_lbl.deleteLater()
+                amp_spin.deleteLater()
+            except Exception:
+                pass
+        self._harm_spinboxes = []
+        while self.harm_container_layout.count():
+            item = self.harm_container_layout.takeAt(0)
+            if item.widget():
+                try:
+                    item.widget().deleteLater()
+                except Exception:
+                    pass
+
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        if not harms:
+            no_data = QLabel("(no harmonic data loaded)")
+            self.harm_container_layout.addWidget(no_data)
+            return
+
+        for order, amp, phase_rad in harms:
+            try:
+                order = int(order)
+                amp = float(amp)
             except Exception:
                 continue
-            if amp > 0 and (best is None or amp > best[1]):
-                best = (order, amp, phase_rad)
-        return best
+            if amp <= 0 and order <= 0:
+                continue
+
+            row = QHBoxLayout()
+            lbl = QLabel(f"H{order}")
+            lbl.setFixedWidth(40)
+            lbl.setStyleSheet("font-weight: bold;")
+            row.addWidget(lbl)
+
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 999999.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(10.0)
+            spin.setValue(amp)
+            spin.valueChanged.connect(lambda v, o=order: self._on_magnitude_changed(o, v))
+            row.addWidget(spin, 1)
+
+            row_w = QWidget()
+            row_w.setLayout(row)
+            self.harm_container_layout.addWidget(row_w)
+            self._harm_spinboxes.append((lbl, spin))
+
+    def _on_magnitude_changed(self, order, val):
+        """Called when a per-harmonic magnitude spinbox is edited."""
+        harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
+        for i, h in enumerate(harms):
+            try:
+                if int(h[0]) == order:
+                    harms[i] = (order, float(val), float(h[2]))
+                    break
+            except Exception:
+                continue
+        self.redraw()
 
     def redraw(self):
         self.orig_series.clear()
         self.shaped_series.clear()
-        
-        dom = self._dominant_harmonic()
-        mult = self.spin_mult.value()
-        if dom is not None:
-            actual_order = dom[0] * mult
-            self.label_dom.setText(f"Dominant order: {dom[0]}  →  editing order {actual_order}  (amp {dom[1]:.0f})")
-        else:
-            self.label_dom.setText("Dominant order: —  (no harmonic table cached)")
+        self.shaped_series.setName("Edited")
 
         harms = getattr(self.tmc_ui, "cogging_harmonics_data", [])
-        shaping = self.spin_shaping.value()
-        mult = self.spin_mult.value()
-        phase_trim_rad = self.spin_phase.value() * math.pi / 180.0
 
         N = 360
-        orig = [0.0] * N
-        shaped = [0.0] * N
+        edited = [0.0] * N
         have_data = False
         for h in harms:
             try:
@@ -2180,46 +2467,37 @@ class HarmShapingTab(QWidget):
             have_data = True
             for i in range(N):
                 theta = (i / N) * 2.0 * math.pi
-                orig[i] += amp * math.sin(order * theta + phase_rad)
-
-        # Compute shaped first (even if no combined data, CW/CCW may have data)
-        for i in range(N):
-            theta = (i / N) * 2.0 * math.pi
-            v = orig[i]
-            if dom is not None and shaping != 0.0:
-                d_order, d_amp, d_phase_rad = dom
-                shaped_arg = mult * (d_order * theta + d_phase_rad) + phase_trim_rad
-                v -= shaping * d_amp * math.sin(shaped_arg)
-            shaped[i] = v
+                edited[i] += amp * math.sin(order * theta + phase_rad)
 
         if not have_data and not self.chk_show_dir_graphs.isChecked():
             self.axisY_wave.setRange(-1.0, 1.0)
             return
 
-        # --- compute Y range including visible CW/CCW direction series ---
-        y_min = min(min(orig), min(shaped))
-        y_max = max(max(orig), max(shaped))
+        # Only auto-scale Y-axis on initial data load, not on manual magnitude edits
+        if not getattr(self, '_y_range_locked', False):
+            y_min = min(edited) if edited else -1.0
+            y_max = max(edited) if edited else 1.0
 
-        # if CW/CCW direction graphs are displayed, include their amplitude range
-        if self.chk_show_dir_graphs.isChecked():
-            for s in (self._dir_cw_series, self._dir_ccw_series):
-                if s.isVisible():
-                    pts = s.points()
-                    if pts:
-                        vals = [p.y() for p in pts]
-                        y_min = min(y_min, min(vals))
-                        y_max = max(y_max, max(vals))
+            if self.chk_show_dir_graphs.isChecked():
+                for s in (self._dir_cw_series, self._dir_ccw_series):
+                    if s.isVisible():
+                        pts = s.points()
+                        if pts:
+                            vals = [p.y() for p in pts]
+                            y_min = min(y_min, min(vals))
+                            y_max = max(y_max, max(vals))
 
-        if y_max - y_min < 1e-6:
-            y_max = y_min + 1.0
-        pad = (y_max - y_min) * 0.1
-        self.axisY_wave.setRange(y_min - pad, y_max + pad)
+            if y_max - y_min < 1e-6:
+                y_max = y_min + 1.0
+            pad = (y_max - y_min) * 0.1
+            self.axisY_wave.setRange(y_min - pad, y_max + pad)
+            self._y_range_locked = True
+
         for i in range(N):
-            deg = i
-            self.orig_series.append(deg, orig[i])
-            self.shaped_series.append(deg, shaped[i])
+            self.shaped_series.append(float(i), edited[i])
 
         self._rebuild_bar_chart()
+        self.updateHarmonicPosition()
 
 
 class CoggingCalibrationTab(QWidget):
@@ -2331,7 +2609,10 @@ class CoggingCalibrationTab(QWidget):
             v = int(val)
             if 1 <= v <= self.MAX_RPM_PROFILES:
                 self._num_rpms = v
-                self.tmc_ui.cogging_profile_count = v
+                # Only increase, never decrease — calibration broadcasts may
+                # have set a larger value for scale-curve RPM profiles.
+                if v > self.tmc_ui.cogging_profile_count:
+                    self.tmc_ui.cogging_profile_count = v
                 self.lbl_num_rpms.setText(str(v))
                 self._rebuild_rpm_profiles()
                 # Update harmonic editor spinbox range if the dialog is already open
@@ -2623,6 +2904,7 @@ class ScalePhaseAdvanceDialog(QDialog):
         self.tmc_ui.send_command("tmc", "phaseAdvCurve", self.axis, '?')
         self.tmc_ui.send_command("tmc", "coggingHarmonics", self.axis, '?')
         QTimer.singleShot(300, self.h3_tab.redraw)
+        QTimer.singleShot(350, self.h3_tab._rebuild_magnitude_editors)
 
     def _parse_curve(self, data, scale):
         result = [0.0] * len(CurveEditorTab.RPM_POINTS)
@@ -2651,6 +2933,7 @@ class ScalePhaseAdvanceDialog(QDialog):
         self.current_rpm = abs(getattr(self.tmc_ui, 'vel_rpm', 0.0))
         self.scale_tab.set_live_rpm(self.current_rpm)
         self.phase_tab.set_live_rpm(self.current_rpm)
+        self.h3_tab.updateHarmonicPosition()
 
 
 class TMC_HW_Version_Selector(OptionsDialogGroupBox,CommunicationHandler):
