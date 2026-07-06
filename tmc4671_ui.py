@@ -498,6 +498,7 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
         flux = None
         cogging = None
         pos = None
+        iqcmd = None
         torque = abs(tflist[0])
         if len(tflist) >= 2:
             flux = tflist[1]
@@ -511,7 +512,9 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
             self.cogging_position = pos
         vel_rpm = 0
         if len(tflist) >= 6:
-            vel_rpm = int(tflist[5])  # velocity RPM from MCU
+            iqcmd = tflist[5]  # pre-anti-cogging torque setpoint (iqCmd)
+        if len(tflist) >= 7:
+            vel_rpm = int(tflist[6])  # velocity RPM from MCU
         self.vel_rpm = vel_rpm
             
         currents = complex(torque, flux if flux is not None else 0)
@@ -526,11 +529,13 @@ class TMC4671Ui(WidgetUI,CommunicationHandler):
                 if flux is not None:
                     txt += f"\nFlux: {amps.imag:+.3f}A"
                     total_amps += abs(amps.imag)
+                if iqcmd is not None:
+                    iq_amps = iqcmd * self.adc_to_amps
+                    txt += f"\nIqCmd: {iq_amps:+.3f}A"
                 if cogging is not None:
                     c_amps = cogging * self.adc_to_amps
                     txt += f"\nCogging: {c_amps:+.3f}A"
-                    total_amps += abs(c_amps)
-                if flux is not None or cogging is not None:
+                if flux is not None:
                     txt += f"\nTotal: {total_amps:.3f}A"
                 
                 self.label_Current.setText(txt)
