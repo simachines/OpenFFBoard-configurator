@@ -2558,6 +2558,15 @@ class CoggingCalibrationTab(QWidget):
         self.chk_friction_ff.toggled.connect(self._on_friction_ff_toggled)
         layout.addWidget(self.chk_friction_ff)
 
+        # Skip Accel DFT checkbox
+        self.chk_skip_accel = QCheckBox("Skip Accel DFT (finish after PID-DFT)")
+        self.chk_skip_accel.setChecked(False)
+        self.chk_skip_accel.setToolTip("When ticked, the regular calibration finishes after PID-DFT "
+                                        "without running the velocity-based accel DFT sweep.\n"
+                                        "Use the 'Accel DFT' tab to run it separately later.")
+        self.chk_skip_accel.toggled.connect(self._on_skip_accel_toggled)
+        layout.addWidget(self.chk_skip_accel)
+
         # ---- Multi-RPM calibration settings ----
         rpm_group = QGroupBox("Multi-RPM Calibration Settings")
         rpm_vbox = QVBoxLayout(rpm_group)
@@ -2726,6 +2735,19 @@ class CoggingCalibrationTab(QWidget):
     def _on_friction_ff_toggled(self, checked):
         self.tmc_ui.send_value("tmc", "coggingCalibFrictionFF", val=1 if checked else 0, instance=self.axis)
 
+    def _on_skip_accel_toggled(self, checked):
+        self.tmc_ui.send_value("tmc", "coggingSkipAccelDFT", val=1 if checked else 0, instance=self.axis)
+
+    def _skip_accel_cb(self, val):
+        """Callback for coggingSkipAccelDFT query."""
+        try:
+            self._loading = True
+            checked = int(val) != 0
+            self.chk_skip_accel.setChecked(checked)
+            self._loading = False
+        except Exception:
+            self._loading = False
+
     def _friction_ff_cb(self, val):
         """Callback for coggingCalibFrictionFF query."""
         try:
@@ -2760,6 +2782,8 @@ class CoggingCalibrationTab(QWidget):
         self.tmc_ui.get_value_async("tmc", "coggingCalibAutoPid", self._auto_pid_cb, self.axis, int)
         # Query friction feedforward flag
         self.tmc_ui.get_value_async("tmc", "coggingCalibFrictionFF", self._friction_ff_cb, self.axis, int)
+        # Query skip accel DFT flag
+        self.tmc_ui.get_value_async("tmc", "coggingSkipAccelDFT", self._skip_accel_cb, self.axis, int)
         # Query RPM targets and iterations and PIDs for each profile
         for i in range(self.MAX_RPM_PROFILES):
             idx = i
@@ -2840,6 +2864,285 @@ class CoggingCalibrationTab(QWidget):
             self._cal_state_timer.stop()
 
 
+class AccelDFTTab(QWidget):
+    """Standalone Accel DFT tab — runs only the velocity-based DFT sweep.
+
+    Requires that a PID-DFT calibration has already populated the harmonic
+    table.  User supplies dmax/dmin (or leaves at 0 for auto-detection)
+    and presses Start.
+
+    Quick-test buttons let you manually test dmax/dmin currents with live RPM.
+    """
+
+    def __init__(self, tmc_ui, axis):
+        super().__init__()
+        self.tmc_ui = tmc_ui
+        self.axis = axis
+        self._running = False
+        self._current_test = None  # "accel", "dmax", "dmin", or None
+
+        layout = QVBoxLayout(self)
+
+        # ---- Info label ----
+        info = QLabel(
+            "Standalone Accel DFT — velocity-based sweep using the existing\n"
+            "harmonic table from a prior PID-DFT calibration as feedforward.\n"
+            "Set dmax/dmin to 0 for auto-detection, or enter manual values."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # ---- Live RPM readout ----
+        rpm_row = QHBoxLayout()
+        rpm_row.addWidget(QLabel("Live RPM:"))
+        self.lbl_rpm = QLabel("0.0")
+        self.lbl_rpm.setStyleSheet("font-size: 18px; font-weight: bold; color: #3daee9;")
+        rpm_row.addWidget(self.lbl_rpm)
+        rpm_row.addStretch(1)
+        layout.addLayout(rpm_row)
+
+        # ---- Separator ----
+        line = QWidget()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background-color: palette(mid);")
+        layout.addWidget(line)
+
+        # ---- Dmax row with Test button ----
+        dmax_row = QHBoxLayout()
+        dmax_row.addWidget(QLabel("dmax:"))
+        self.spin_dmax = QDoubleSpinBox()
+        self.spin_dmax.setRange(0, 20000)
+        self.spin_dmax.setDecimals(0)
+        self.spin_dmax.setSingleStep(10)
+        self.spin_dmax.setValue(0)
+        self.spin_dmax.setToolTip("Breakaway torque (mA). 0 = auto-detect.\n"
+                                   "The minimum current that reliably breaks the rotor free from any detent.")
+        self.spin_dmax.setSuffix(" mA")
+        dmax_row.addWidget(self.spin_dmax)
+        self.btn_test_dmax = QPushButton("Test dmax")
+        self.btn_test_dmax.setToolTip("Inject dmax current immediately and hold until Stop.\nWatch the live RPM to see if the motor breaks free.")
+        self.btn_test_dmax.clicked.connect(self._on_test_dmax)
+        self.btn_test_dmax.setMaximumWidth(90)
+        dmax_row.addWidget(self.btn_test_dmax)
+        dmax_row.addStretch(1)
+        layout.addLayout(dmax_row)
+
+        # ---- Dmin row with Test button ----
+        dmin_row = QHBoxLayout()
+        dmin_row.addWidget(QLabel("dmin:"))
+        self.spin_dmin = QDoubleSpinBox()
+        self.spin_dmin.setRange(0, 20000)
+        self.spin_dmin.setDecimals(0)
+        self.spin_dmin.setSingleStep(10)
+        self.spin_dmin.setValue(0)
+        self.spin_dmin.setToolTip("Sustain torque (mA). 0 = auto-detect.\n"
+                                   "The minimum current that keeps the rotor spinning once already moving.")
+        self.spin_dmin.setSuffix(" mA")
+        dmin_row.addWidget(self.spin_dmin)
+        self.btn_test_dmin = QPushButton("Test dmin")
+        self.btn_test_dmin.setToolTip("Inject dmin current immediately and hold until Stop.\nWatch the live RPM to see if rotation sustains.")
+        self.btn_test_dmin.clicked.connect(self._on_test_dmin)
+        self.btn_test_dmin.setMaximumWidth(90)
+        dmin_row.addWidget(self.btn_test_dmin)
+        dmin_row.addStretch(1)
+        layout.addLayout(dmin_row)
+
+        # ---- Anti-Cogging Feedforward toggle ----
+        ff_row = QHBoxLayout()
+        self.chk_anticog_ff = QCheckBox("Anti-Cogging Feedforward")
+        self.chk_anticog_ff.setChecked(True)
+        self.chk_anticog_ff.setToolTip("Enable/disable the anti-cogging harmonic feedforward\n"
+                                        "during the accel DFT sweep and manual current tests.\n"
+                                        "Disable to see the raw motor behaviour without compensation.")
+        self.chk_anticog_ff.toggled.connect(self._on_anticog_ff_toggled)
+        ff_row.addWidget(self.chk_anticog_ff)
+        ff_row.addStretch(1)
+        layout.addLayout(ff_row)
+
+        # ---- Iterations (for full sweep) ----
+        iter_row = QHBoxLayout()
+        iter_row.addWidget(QLabel("Iterations:"))
+        self.spin_iters = QSpinBox()
+        self.spin_iters.setRange(1, 20)
+        self.spin_iters.setValue(3)
+        self.spin_iters.setToolTip("Number of CW+CCW sweep pairs for the full accel DFT.\n"
+                                    "Each iteration refines the harmonic table using the velocity DFT results.\n"
+                                    "More iterations = better convergence, but longer runtime.")
+        iter_row.addWidget(self.spin_iters)
+        iter_row.addStretch(1)
+        layout.addLayout(iter_row)
+
+        # ---- Start / Stop buttons ----
+        btn_row = QHBoxLayout()
+        self.btn_start = QPushButton("Start Accel DFT")
+        self.btn_start.setToolTip("Run full standalone velocity-based DFT sweep with the specified iterations")
+        self.btn_start.clicked.connect(self._on_start)
+        btn_row.addWidget(self.btn_start)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setToolTip("Abort the running calibration / test")
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_stop.setEnabled(False)
+        btn_row.addWidget(self.btn_stop)
+        layout.addLayout(btn_row)
+
+        # ---- Status label ----
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(self.lbl_status)
+
+        layout.addStretch(1)
+
+        # RPM poll timer (50ms)
+        self._rpm_timer = QTimer(self)
+        self._rpm_timer.setInterval(50)
+        self._rpm_timer.timeout.connect(self._poll_rpm)
+
+        # State poll timer (500ms)
+        self._state_timer = QTimer(self)
+        self._state_timer.setInterval(500)
+        self._state_timer.timeout.connect(self._poll_state)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._rpm_timer.start()
+        self._state_timer.start()
+        self._poll_state()
+
+    def hideEvent(self, event):
+        self._rpm_timer.stop()
+        self._state_timer.stop()
+        super().hideEvent(event)
+
+    def _poll_rpm(self):
+        rpm = abs(getattr(self.tmc_ui, 'vel_rpm', 0.0))
+        self.lbl_rpm.setText(f"{rpm:.1f}")
+
+    def _poll_state(self):
+        calibrating = getattr(self.tmc_ui, 'cogging_calibrating', False)
+        # Manual dmax/dmin tests do NOT set cogging_calibrating on the firmware,
+        # so the state poll must not override their running status.
+        is_manual_test = self._current_test in ("dmax", "dmin")
+        if calibrating and not self._running:
+            self._running = True
+            self._set_buttons_running(True)
+            self.lbl_status.setText("Running...")
+            self.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
+        elif not calibrating and self._running and not is_manual_test:
+            self._running = False
+            self._set_buttons_running(False)
+            self.lbl_status.setText("Completed")
+            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+        elif not calibrating and not is_manual_test:
+            self._set_buttons_running(False)
+            if self.lbl_status.text() == "Running...":
+                self.lbl_status.setText("Ready")
+                self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+
+    def _set_buttons_running(self, running):
+        self.btn_start.setEnabled(not running)
+        self.btn_test_dmax.setEnabled(not running)
+        self.btn_test_dmin.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+
+    def shutdown(self):
+        if hasattr(self, '_state_timer') and self._state_timer is not None:
+            self._state_timer.stop()
+        if hasattr(self, '_rpm_timer') and self._rpm_timer is not None:
+            self._rpm_timer.stop()
+
+    def _send_overrides(self, dmax, dmin, iters):
+        """Send dmax/dmin overrides and iteration count to firmware."""
+        self.tmc_ui.send_value("tmc", "coggingAccelDmax", val=int(dmax), instance=self.axis)
+        self.tmc_ui.send_value("tmc", "coggingAccelDmin", val=int(dmin), instance=self.axis)
+        # Use RPM profile 0 (base table) with the requested iterations
+        self.tmc_ui.send_value("tmc", "coggingCalibIters", adr=0, val=iters, instance=self.axis)
+
+    def _validate_dmax_dmin(self, dmax, dmin):
+        if dmax > 0 and dmin > 0 and dmin >= dmax:
+            QMessageBox.warning(self, "Invalid dmax/dmin",
+                "dmin must be less than dmax.\n\n"
+                "dmax = breakaway torque (higher)\n"
+                "dmin = sustain torque (lower)")
+            return False
+        return True
+
+    def _on_start(self):
+        dmax = self.spin_dmax.value()
+        dmin = self.spin_dmin.value()
+        iters = self.spin_iters.value()
+        if not self._validate_dmax_dmin(dmax, dmin):
+            return
+
+        self._send_overrides(dmax, dmin, iters)
+        self.tmc_ui.send_command("tmc", "coggingAccelDFT", self.axis)
+
+        self._current_test = "accel"
+        self._running = True
+        self._set_buttons_running(True)
+        self.lbl_status.setText("Running Accel DFT...")
+        self.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
+
+    def _on_test_dmax(self):
+        """Quick-test: inject dmax current immediately and hold until Stop."""
+        dmax = self.spin_dmax.value()
+        if dmax <= 0:
+            QMessageBox.warning(self, "Enter dmax",
+                "Please enter a dmax value to test.\n"
+                "dmax = breakaway torque — the current needed to\n"
+                "break the rotor free from any cogging detent.")
+            return
+
+        self.tmc_ui.send_value("tmc", "coggingTestTorque", adr=1, val=int(dmax), instance=self.axis)
+
+        self._current_test = "dmax"
+        self._running = True
+        self._set_buttons_running(True)
+        self.lbl_status.setText(f"Testing dmax={dmax:.0f} mA — click Stop")
+        self.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
+
+    def _on_test_dmin(self):
+        """Quick-test: inject dmin current immediately and hold until Stop."""
+        dmin = self.spin_dmin.value()
+        if dmin <= 0:
+            QMessageBox.warning(self, "Enter dmin",
+                "Please enter a dmin value to test.\n"
+                "dmin = sustain torque — the minimum current that\n"
+                "keeps the rotor spinning after breakaway.")
+            return
+
+        self.tmc_ui.send_value("tmc", "coggingTestTorque", adr=1, val=int(dmin), instance=self.axis)
+
+        self._current_test = "dmin"
+        self._running = True
+        self._set_buttons_running(True)
+        self.lbl_status.setText(f"Testing dmin={dmin:.0f} mA — click Stop")
+        self.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
+
+    def _on_anticog_ff_toggled(self, checked):
+        """Enable/disable anti-cogging feedforward on the firmware."""
+        self.tmc_ui.send_value("tmc", "cogging", val=1 if checked else 0, instance=self.axis)
+
+    def _on_stop(self):
+        """Stop test torque or abort calibration."""
+        # For manual dmax/dmin tests, just stop the test torque.
+        # The firmware's coggingTestTorque adr=0 cleanly exits the loop.
+        # Do NOT send coggingAbort for manual tests — it sets emergency=true
+        # which blocks subsequent test starts.
+        if self._current_test in ("dmax", "dmin"):
+            self.tmc_ui.send_value("tmc", "coggingTestTorque", adr=0, val=0, instance=self.axis)
+        else:
+            # Full accel DFT — abort the calibration
+            self.tmc_ui.send_value("tmc", "coggingTestTorque", adr=0, val=0, instance=self.axis)
+            self.tmc_ui.send_command("tmc", "coggingAbort", self.axis)
+
+        self._current_test = None
+        self._running = False
+        self._set_buttons_running(False)
+        self.lbl_status.setText("Stopping...")
+        self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+
+
 class ScalePhaseAdvanceDialog(QDialog):
     """Tabbed editor for Cogging Calibration.
 
@@ -2879,6 +3182,10 @@ class ScalePhaseAdvanceDialog(QDialog):
         self.h3_tab = HarmShapingTab(tmc_ui, axis)
         self.tabs.addTab(self.h3_tab, "Harmonic Editor")
 
+        # Accel DFT tab
+        self.accel_dft_tab = AccelDFTTab(tmc_ui, axis)
+        self.tabs.addTab(self.accel_dft_tab, "Accel DFT")
+
         # Live RPM dot polling (20ms)
         self.live_timer = QTimer(self)
         self.live_timer.setInterval(20)
@@ -2900,6 +3207,7 @@ class ScalePhaseAdvanceDialog(QDialog):
     def closeEvent(self, event):
         self.live_timer.stop()
         self.cogging_cal_tab.shutdown()
+        self.accel_dft_tab.shutdown()
         super().closeEvent(event)
 
     def _load_curves(self):
